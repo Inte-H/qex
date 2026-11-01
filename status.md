@@ -2,6 +2,7 @@
 
 ## 결정 (2026-11-01, 드라이버)
 - 포크 재설계는 멈춘다. 대기 문제는 무거운 명령 훅(~/.claude/hooks/heavy-queue-bash.sh)에서 JS 작업에만 `--mem 2GB` 를 붙여 푼다(JS 작업 실측 최대 1.47GB, 122건). 여유분 2GB·기본값 3GB 는 그대로 — 회사 Gradle 은 설정상 데몬·테스트 프로세스가 각 최대 4GB 라 기본값을 낮추지 않는다.
+- 이어서 ~/.config/qex.toml 에 [system] reserve_mem = "512MB", max_pressure = 10 을 넣음 — leasehold 의 메모리 판단(큐 밖 프로그램 메모리는 세지 않고 부족 신호 10% 에서 막음, 최소 가용 512MB)을 qex 우선순위·훅을 유지한 채 따라 함. 이로써 포크 기능은 필요 없어짐.
 - JS 가 아닌 작업이 다시 오래 기다리면 그때 이 브랜치(feat/relax-reserve-after-wait)나 leasehold(부족 신호 기반 막기, 알파)를 다시 본다.
 
 
