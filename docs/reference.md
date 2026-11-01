@@ -889,6 +889,14 @@ nothing else. To keep the machine empty for a job that waits for another user
 gives that job nothing, and it stops every other job — a queue that never moves
 with no cause.
 
+A program outside qex can hold the memory for hours while the machine has no
+memory pressure at all. `[system] reserve_relax_after` ends that wait: when the
+job at the front has waited that long and the memory pressure stays below 1.0,
+the job uses `[system] reserve_floor` in place of `reserve_mem`. The floor is
+never 0, so a program outside qex that grows still has room. A job that starts
+this way has `forced` true, and `forced_reason` says how long it waited. A
+machine that gives no pressure value keeps the full reserve.
+
 `[queue] max_bypass` gives the number of jobs that may pass. The default is 2.
 Set `max_bypass = 0` for a strict order, in which no job passes the job at the
 front. **That value applies to the two rows above that keep capacity only.** The
@@ -1467,6 +1475,9 @@ mem = "75%"           # memory that qex can use; 90% under single-user
 [system]
 reserve_mem  = "2GB"  # memory to keep free; 512MB under single-user
 max_pressure = 20     # maximum PSI memory pressure (Linux only)
+reserve_relax_after = "0"  # a wait at the front after which the reserve falls
+                           # to reserve_floor; 0 means never
+reserve_floor = "512MB"    # the lower reserve; never 0
 
 [enforce]
 mode = "cooperative"  # cooperative, or single-user

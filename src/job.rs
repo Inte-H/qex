@@ -540,10 +540,9 @@ pub struct JobStatus {
     #[serde(default)]
     pub group_name: Option<String>,
     pub usage: Usage,
-    /// Shows that qex started the job although it is larger than the budget.
-    ///
-    /// qex starts such a job when no other job operates. A job that stays in
-    /// the queue for ever gives no data to the agent.
+    /// Shows that qex started the job outside the usual rule: the job is larger
+    /// than the budget, or it started with `[system] reserve_floor` after a
+    /// long wait at the front.
     #[serde(default)]
     pub forced: bool,
     /// The reason for a forced start, in text for a person to read.

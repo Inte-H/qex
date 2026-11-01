@@ -398,7 +398,7 @@ pub const STATUS: &str = r##"{
     },
     "forced": {
       "type": "boolean",
-      "description": "True if qex started the job although the claim is larger than the budget. qex starts such a job alone. The job can swap or stop with an out-of-memory error."
+      "description": "True if qex started the job outside the usual rule: the claim is larger than the budget and qex started it alone, or the job waited [system] reserve_relax_after at the front and started with [system] reserve_floor in place of reserve_mem. The job can swap or stop with an out-of-memory error."
     },
     "forced_reason": {
       "type": ["string", "null"],

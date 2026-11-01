@@ -775,6 +775,9 @@ that qex uses now.
     [system]
     reserve_mem  = \"2GB\"  # memory to keep free for other programs (see mode)
     max_pressure = 20     # maximum PSI memory pressure (Linux only)
+    reserve_relax_after = \"0\"  # a wait at the front after which the reserve
+                                # falls to reserve_floor; 0 means never
+    reserve_floor = \"512MB\"    # the lower reserve; never 0
 
     [enforce]
     mode = \"cooperative\" # cooperative, or single-user
@@ -1360,7 +1363,11 @@ they do not have the same effect on the jobs behind:
      for the job at the front after `[queue] max_bypass` jobs passed it.
   2. Another user. qex does not control that user, so the wait has no known end.
      qex starts the jobs behind, and it keeps no capacity.
-  3. A program outside qex, or memory pressure. The same rule as 2.
+  3. A program outside qex, or memory pressure. The same rule as 2. With
+     `[system] reserve_relax_after`, the job at the front that waited that long
+     while the memory pressure stayed below 1.0 uses `reserve_floor` in place of
+     `reserve_mem`. Its `forced` field is then true, and `forced_reason` says
+     how long it waited.
   4. The size of the job. A job that is larger than the budget waits for a quiet
      machine, or the config file keeps it in the queue.
 

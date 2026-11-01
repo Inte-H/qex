@@ -421,7 +421,23 @@ pub struct SystemConfig {
     /// Linux supplies this measurement. macOS does not.
     #[serde(deserialize_with = "decimal_number")]
     pub max_pressure: f64,
+    /// The wait at the front of the queue after which the reserve falls to
+    /// `reserve_floor`. `0` keeps the full reserve for ever.
+    pub reserve_relax_after: String,
+    /// The reserve for a job that waited `reserve_relax_after` at the front of
+    /// the queue while the memory pressure stayed below [`RELAX_PRESSURE`].
+    ///
+    /// It must be larger than 0: a program outside qex can still grow.
+    #[serde(deserialize_with = "text_or_number")]
+    pub reserve_floor: String,
 }
+
+/// The memory pressure below which qex may lower the reserve.
+///
+/// The PSI value is the share of time in which tasks stalled on memory. A
+/// value below 1.0 means that the machine is not short of memory, and that the
+/// small available number comes from memory the kernel parked.
+pub const RELAX_PRESSURE: f64 = 1.0;
 
 impl Default for SystemConfig {
     fn default() -> Self {
@@ -429,6 +445,8 @@ impl Default for SystemConfig {
             // EMPTY means "choose from `[enforce] mode`". See `reserve_mem`.
             reserve_mem: String::new(),
             max_pressure: 20.0,
+            reserve_relax_after: "0".into(),
+            reserve_floor: "512MB".into(),
         }
     }
 }
@@ -1451,6 +1469,24 @@ impl Config {
             .map_err(|e| anyhow::anyhow!("config [system] reserve_mem: {e}"))
     }
 
+    /// `None` keeps the full reserve.
+    pub fn reserve_relax_after(&self) -> Result<Option<std::time::Duration>> {
+        units::parse_duration(&self.system.reserve_relax_after)
+            .map_err(|e| anyhow::anyhow!("config [system] reserve_relax_after: {e}"))
+    }
+
+    pub fn reserve_floor(&self) -> Result<u64> {
+        let floor = units::parse_size(&self.system.reserve_floor)
+            .map_err(|e| anyhow::anyhow!("config [system] reserve_floor: {e}"))?;
+        if floor == 0 {
+            anyhow::bail!(
+                "config [system] reserve_floor: 0 removes the whole reserve; give a size such \
+                 as `512MB`"
+            );
+        }
+        Ok(floor)
+    }
+
     pub fn settle(&self) -> Result<std::time::Duration> {
         units::parse_duration(&self.queue.settle)
             .map_err(|e| anyhow::anyhow!("config [queue] settle: {e}"))
@@ -1774,6 +1810,8 @@ impl Config {
         self.budget_cpu()?;
         self.budget_mem()?;
         self.reserve_mem()?;
+        self.reserve_relax_after()?;
+        self.reserve_floor()?;
         self.settle()?;
         self.peer_stale_after()?;
         self.history_keep()?;

@@ -9,13 +9,13 @@
 //! out-of-memory error. That result is data for the agent. A job that waits for
 //! ever gives no data.
 
-use crate::config::{Config, OversizedPolicy, Pool};
+use crate::config::{Config, OversizedPolicy, Pool, RELAX_PRESSURE};
 use crate::daemon::{log, Coordinator};
 use crate::job::{self, Assignment, JobState};
 use crate::paths;
 use crate::spec::{JobSpec, PoolClaim};
 use crate::sys;
-use crate::units::{count_of, format_size};
+use crate::units::{count_of, format_duration, format_size};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -699,6 +699,7 @@ fn assign(
 ///
 /// `machine` holds one measurement of the machine and of the other users for
 /// the whole pass. See [`Machine`].
+#[allow(clippy::too_many_arguments)]
 fn admit(
     cfg: &Config,
     pools: &[Pool],
@@ -707,6 +708,7 @@ fn admit(
     mem: u64,
     held: &Held,
     machine: &Machine,
+    reserve: u64,
 ) -> Admit {
     let cpu_budget = cfg.budget_cpu().unwrap_or(1);
     let mem_budget = cfg.budget_mem().unwrap_or(0);
@@ -798,7 +800,6 @@ fn admit(
 
     // Test 4: the machine. This test finds every load, and not the load of qex
     // only. It is the test that a program outside qex cannot avoid.
-    let reserve = cfg.reserve_mem().unwrap_or(0);
     let available = machine.available;
     if available < reserve + mem {
         // Say what this number is, and what it is not.
@@ -864,6 +865,50 @@ fn admit(
     Admit::Yes
 }
 
+/// What `[system] reserve_relax_after` does for the job at the front of the
+/// queue in this pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Relax {
+    /// The full reserve holds: the option is off, the floor is not smaller
+    /// than the reserve, or the machine has pressure or does not report it.
+    Off,
+    Later {
+        floor: u64,
+        after: Duration,
+        left: Duration,
+    },
+    Now {
+        floor: u64,
+        waited: Duration,
+    },
+}
+
+/// Only the front job gets a lower reserve, and only while the machine says
+/// that it is not short of memory.
+fn relax(cfg: &Config, machine: &Machine, blocked_since: Option<u64>, now: u64) -> Relax {
+    let Ok(Some(after)) = cfg.reserve_relax_after() else {
+        return Relax::Off;
+    };
+    let (Ok(floor), Ok(reserve)) = (cfg.reserve_floor(), cfg.reserve_mem()) else {
+        return Relax::Off;
+    };
+    if floor >= reserve || !machine.pressure.is_some_and(|p| p < RELAX_PRESSURE) {
+        return Relax::Off;
+    }
+    // The first pass at the front writes `blocked_since` after this test, so
+    // a job with no value has waited for nothing yet.
+    let waited = Duration::from_secs(now.saturating_sub(blocked_since.unwrap_or(now)));
+    if waited >= after {
+        Relax::Now { floor, waited }
+    } else {
+        Relax::Later {
+            floor,
+            after,
+            left: after - waited,
+        }
+    }
+}
+
 /// The decision for one job that has no dependency and no lock left.
 enum Verdict {
     /// The job can start now.
@@ -890,6 +935,7 @@ fn verdict(
     mem: u64,
     held: &Held,
     machine: &Machine,
+    reserve: u64,
     quiet: bool,
 ) -> Verdict {
     // A claim that the configuration can never satisfy comes first, and the
@@ -913,7 +959,7 @@ fn verdict(
 
     let claims = effective_claims(spec);
     match size_check(cfg, cpu, mem) {
-        Size::Fits => match admit(cfg, pools, &claims, cpu, mem, held, machine) {
+        Size::Fits => match admit(cfg, pools, &claims, cpu, mem, held, machine, reserve) {
             Admit::Yes => Verdict::Start,
             Admit::No {
                 blocker,
@@ -1153,7 +1199,7 @@ fn step(coord: &Arc<Coordinator>) -> anyhow::Result<(usize, usize)> {
 
         match choice.start {
             Some(id) => {
-                start_job(coord, id)?;
+                start_job(coord, id, choice.relaxed)?;
                 started += 1;
             }
             None => break,
@@ -1478,6 +1524,7 @@ struct Choice {
     /// dependency expired at 3s returned at 33.0s, and on a job whose
     /// dependency was cancelled at 1s returned at 31.0s.
     finished: usize,
+    relaxed: Option<String>,
 }
 
 /// The job at the front of the queue that cannot start now.
@@ -1545,6 +1592,11 @@ struct Head {
 /// head start while the head cannot. The head keeps its place, and it starts
 /// before every job behind it as soon as it can start.
 fn choose(state: &mut crate::daemon::State) -> Choice {
+    let machine = Machine::read(&state.cfg);
+    choose_on(state, machine)
+}
+
+fn choose_on(state: &mut crate::daemon::State, machine: Machine) -> Choice {
     let held = state.claimed();
     let cfg = state.cfg.clone();
     // A config file that qex cannot read gives no pool. Every claim then falls
@@ -1561,8 +1613,9 @@ fn choose(state: &mut crate::daemon::State) -> Choice {
     let settle = cfg.settle().unwrap_or(Duration::from_secs(3));
     let quiet = active == 0 && idle_since.map(|t| t.elapsed() >= settle).unwrap_or(false);
 
-    // Measure the machine one time for this pass. See [`Machine`].
-    let machine = Machine::read(&cfg);
+    let reserve = cfg.reserve_mem().unwrap_or(0);
+    let now = sys::now_secs();
+    let mut relaxed: Option<String> = None;
 
     // Collect the decisions first. The loop cannot change the state while it
     // reads the jobs.
@@ -1675,9 +1728,52 @@ fn choose(state: &mut crate::daemon::State) -> Choice {
         let name = job.status.display_name();
         let passed_by = job.status.passed_by;
 
-        match verdict(
-            &cfg, &pools, &job.spec, claim_cpu, claim_mem, &held, &machine, quiet,
-        ) {
+        let mut outcome = verdict(
+            &cfg, &pools, &job.spec, claim_cpu, claim_mem, &held, &machine, reserve, quiet,
+        );
+        if head.is_none()
+            && matches!(
+                &outcome,
+                Verdict::Wait {
+                    blocker: Blocker::Machine,
+                    ..
+                }
+            )
+        {
+            match relax(&cfg, &machine, job.status.blocked_since, now) {
+                Relax::Off => {}
+                Relax::Now { floor, waited } => {
+                    outcome = verdict(
+                        &cfg, &pools, &job.spec, claim_cpu, claim_mem, &held, &machine, floor,
+                        quiet,
+                    );
+                    if matches!(outcome, Verdict::Start) {
+                        relaxed = Some(format!(
+                            "qex lowered the reserve from {} to {} for this job: it waited {} at \
+                             the front of the queue, and the memory pressure was {:.1}.",
+                            format_size(reserve),
+                            format_size(floor),
+                            format_duration(waited),
+                            machine.pressure.unwrap_or(0.0)
+                        ));
+                    }
+                }
+                Relax::Later { floor, after, left } => {
+                    if let Verdict::Wait { reason, .. } = &mut outcome {
+                        reason.push_str(&format!(
+                            " qex lowers the reserve of this job to {} when it has waited {} at \
+                             the front of the queue and the memory pressure stays below \
+                             {RELAX_PRESSURE:.1}: {} from now.",
+                            format_size(floor),
+                            format_duration(after),
+                            format_duration(left)
+                        ));
+                    }
+                }
+            }
+        }
+
+        match outcome {
             Verdict::Start => {
                 chosen = Some(id);
                 started_now = Some(id);
@@ -1854,11 +1950,16 @@ fn choose(state: &mut crate::daemon::State) -> Choice {
     Choice {
         start: chosen,
         finished,
+        relaxed,
     }
 }
 
 /// Starts the supervisor of one job.
-fn start_job(coord: &Arc<Coordinator>, id: uuid::Uuid) -> anyhow::Result<()> {
+fn start_job(
+    coord: &Arc<Coordinator>,
+    id: uuid::Uuid,
+    relaxed: Option<String>,
+) -> anyhow::Result<()> {
     // Take the job and test it again, with one lock only.
     //
     // The scheduler chose this job and then released the lock. In that moment,
@@ -1919,7 +2020,7 @@ fn start_job(coord: &Arc<Coordinator>, id: uuid::Uuid) -> anyhow::Result<()> {
             Size::TooBig(reason) => Some(format!(
                 "{reason}. qex started this job alone because no other job operated."
             )),
-            Size::Fits => None,
+            Size::Fits => relaxed,
         };
 
         // Give the devices INSIDE this lock hold, before the record is written
@@ -1999,7 +2100,7 @@ fn start_job(coord: &Arc<Coordinator>, id: uuid::Uuid) -> anyhow::Result<()> {
 
     if let Some(reason) = &forced_reason {
         log(&format!(
-            "job {id} ({name}) starts although it is too large: {reason}"
+            "job {id} ({name}) starts outside the usual rule: {reason}"
         ));
     }
 
@@ -2124,6 +2225,7 @@ mod tests {
             mem,
             &used(cpu_used, mem_used),
             m,
+            cfg.reserve_mem().unwrap(),
         )
     }
 
@@ -2146,6 +2248,7 @@ mod tests {
             mem,
             &used(cpu_used, mem_used),
             m,
+            cfg.reserve_mem().unwrap(),
             quiet,
         )
     }
@@ -2298,6 +2401,125 @@ mod tests {
             "the reserve must stop this job",
         );
         assert!(reason.contains("reserve"), "got: {reason}");
+    }
+
+    /// A config with a reserve of 2GB that falls to 512MB after 10 minutes.
+    fn cfg_relaxing() -> Config {
+        let mut cfg = cfg_with("4", "8GB");
+        cfg.system.reserve_mem = "2GB".into();
+        cfg.system.reserve_relax_after = "10m".into();
+        cfg
+    }
+
+    fn machine_with(available: u64, pressure: Option<f64>) -> Machine {
+        Machine {
+            available,
+            pressure,
+            peers: Default::default(),
+        }
+    }
+
+    #[test]
+    fn the_reserve_falls_only_after_the_wait_and_only_at_low_pressure() {
+        let cfg = cfg_relaxing();
+        let calm = machine_with(1 << 30, Some(0.0));
+        let now = 10_000;
+
+        assert_eq!(
+            relax(&cfg, &calm, Some(now - 600), now),
+            Relax::Now {
+                floor: 512 << 20,
+                waited: Duration::from_secs(600)
+            }
+        );
+        assert_eq!(
+            relax(&cfg, &calm, Some(now - 60), now),
+            Relax::Later {
+                floor: 512 << 20,
+                after: Duration::from_secs(600),
+                left: Duration::from_secs(540)
+            }
+        );
+        // The first pass at the front has no `blocked_since` yet.
+        assert!(matches!(relax(&cfg, &calm, None, now), Relax::Later { .. }));
+
+        let pressed = machine_with(1 << 30, Some(RELAX_PRESSURE));
+        assert_eq!(relax(&cfg, &pressed, Some(0), now), Relax::Off);
+        let unknown = machine_with(1 << 30, None);
+        assert_eq!(relax(&cfg, &unknown, Some(0), now), Relax::Off);
+
+        let mut off = cfg_relaxing();
+        off.system.reserve_relax_after = "0".into();
+        assert_eq!(relax(&off, &calm, Some(0), now), Relax::Off);
+
+        let mut floor_too_high = cfg_relaxing();
+        floor_too_high.system.reserve_floor = "2GB".into();
+        assert_eq!(relax(&floor_too_high, &calm, Some(0), now), Relax::Off);
+    }
+
+    #[test]
+    fn a_floor_of_zero_is_refused() {
+        let mut cfg = cfg_relaxing();
+        cfg.system.reserve_floor = "0".into();
+        assert!(cfg.validate().is_err());
+    }
+
+    /// A job of 1GB at the front, on a machine with 2GB available: the full
+    /// reserve of 2GB stops it, and the floor of 512MB lets it start.
+    fn state_with_front_of_1gb(blocked_since: Option<u64>) -> (crate::daemon::State, uuid::Uuid) {
+        let mut state = state_with(JobState::Running, None, 0);
+        state.queue.clear();
+        state.jobs.clear();
+        state.cfg = cfg_relaxing();
+        let front = add_job(&mut state, JobState::Queued, 1, None, 0);
+        let job = state.jobs.get_mut(&front).unwrap();
+        job.status.mem = 1 << 30;
+        job.status.blocked_since = blocked_since;
+        (state, front)
+    }
+
+    #[test]
+    fn the_front_job_starts_with_the_floor_after_the_wait_and_says_so() {
+        let (mut state, front) = state_with_front_of_1gb(Some(sys::now_secs() - 601));
+
+        let choice = choose_on(&mut state, machine_with(2 << 30, Some(0.0)));
+
+        assert_eq!(choice.start, Some(front));
+        let why = choice.relaxed.expect("a start with the floor must say so");
+        assert!(why.contains("2GB") && why.contains("512MB"), "got: {why}");
+    }
+
+    #[test]
+    fn the_front_job_waits_before_the_wait_is_over_and_says_when_it_starts() {
+        let (mut state, front) = state_with_front_of_1gb(Some(sys::now_secs() - 60));
+
+        let choice = choose_on(&mut state, machine_with(2 << 30, Some(0.0)));
+
+        assert_eq!(choice.start, None);
+        assert_eq!(choice.relaxed, None);
+        let reason = state.jobs[&front].status.blocked_reason.clone().unwrap();
+        assert!(reason.contains("lowers the reserve"), "got: {reason}");
+    }
+
+    #[test]
+    fn the_front_job_keeps_the_full_reserve_under_pressure() {
+        let (mut state, front) = state_with_front_of_1gb(Some(0));
+
+        let choice = choose_on(&mut state, machine_with(2 << 30, Some(5.0)));
+
+        assert_eq!(choice.start, None);
+        let reason = state.jobs[&front].status.blocked_reason.clone().unwrap();
+        assert!(!reason.contains("lowers the reserve"), "got: {reason}");
+    }
+
+    #[test]
+    fn a_job_that_fits_starts_with_no_mark() {
+        let (mut state, front) = state_with_front_of_1gb(Some(0));
+
+        let choice = choose_on(&mut state, machine_with(8 << 30, Some(0.0)));
+
+        assert_eq!(choice.start, Some(front));
+        assert_eq!(choice.relaxed, None);
     }
 
     /// A paused queue must expire NO job.
@@ -3542,6 +3764,7 @@ mod tests {
             spec.mem,
             held,
             &Machine::read(cfg),
+            cfg.reserve_mem().unwrap(),
         )
     }
 
@@ -3625,6 +3848,7 @@ mod tests {
             spec.mem,
             &Held::default(),
             &Machine::read(&cfg),
+            cfg.reserve_mem().unwrap(),
             false,
         )
         else {
@@ -3710,6 +3934,7 @@ mod tests {
             claim.mem,
             &Held::default(),
             &machine,
+            cfg.reserve_mem().unwrap(),
         )
         else {
             panic!("3 of `net` must not fit while another user holds 2 of the 4");
@@ -3755,6 +3980,7 @@ mod tests {
             claim.mem,
             &held,
             &machine,
+            cfg.reserve_mem().unwrap(),
         )
         else {
             panic!("only one of the two requested units is free now");
@@ -4131,6 +4357,7 @@ mod tests {
                 whole.mem,
                 &Held::default(),
                 &machine_free,
+                cfg.reserve_mem().unwrap(),
             ),
             Admit::Yes
         ));
@@ -4157,6 +4384,7 @@ mod tests {
             whole.mem,
             &Held::default(),
             &machine_busy,
+            cfg.reserve_mem().unwrap(),
         ) else {
             panic!("a device that another user holds must not go to this job as well");
         };
