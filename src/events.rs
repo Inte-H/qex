@@ -833,6 +833,7 @@ mod tests {
             paused: crate::pause::Paused::default(),
             last_start_at: None,
             head: None,
+            calm_head: None,
             peer_claims: Default::default(),
             stop: false,
         }

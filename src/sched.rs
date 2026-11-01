@@ -869,13 +869,12 @@ fn admit(
 /// queue in this pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Relax {
-    /// The full reserve holds: the option is off, the floor is not smaller
-    /// than the reserve, or the machine has pressure or does not report it.
+    /// The full reserve holds: the option is off, or the floor is not smaller
+    /// than the reserve.
     Off,
     Later {
         floor: u64,
         after: Duration,
-        left: Duration,
     },
     Now {
         floor: u64,
@@ -883,29 +882,18 @@ enum Relax {
     },
 }
 
-/// Only the front job gets a lower reserve, and only while the machine says
-/// that it is not short of memory.
-fn relax(cfg: &Config, machine: &Machine, blocked_since: Option<u64>, now: u64) -> Relax {
-    let Ok(Some(after)) = cfg.reserve_relax_after() else {
+fn relax(cfg: &Config, reserve: u64, calm_since: u64, now: u64) -> Relax {
+    let (Ok(Some(after)), Ok(floor)) = (cfg.reserve_relax_after(), cfg.reserve_floor()) else {
         return Relax::Off;
     };
-    let (Ok(floor), Ok(reserve)) = (cfg.reserve_floor(), cfg.reserve_mem()) else {
-        return Relax::Off;
-    };
-    if floor >= reserve || !machine.pressure.is_some_and(|p| p < RELAX_PRESSURE) {
+    if floor >= reserve {
         return Relax::Off;
     }
-    // The first pass at the front writes `blocked_since` after this test, so
-    // a job with no value has waited for nothing yet.
-    let waited = Duration::from_secs(now.saturating_sub(blocked_since.unwrap_or(now)));
+    let waited = Duration::from_secs(now.saturating_sub(calm_since));
     if waited >= after {
         Relax::Now { floor, waited }
     } else {
-        Relax::Later {
-            floor,
-            after,
-            left: after - waited,
-        }
+        Relax::Later { floor, after }
     }
 }
 
@@ -1616,6 +1604,8 @@ fn choose_on(state: &mut crate::daemon::State, machine: Machine) -> Choice {
     let reserve = cfg.reserve_mem().unwrap_or(0);
     let now = sys::now_secs();
     let mut relaxed: Option<String> = None;
+    let prev_calm = state.calm_head;
+    let mut calm_head: Option<(uuid::Uuid, u64)> = None;
 
     // Collect the decisions first. The loop cannot change the state while it
     // reads the jobs.
@@ -1739,34 +1729,47 @@ fn choose_on(state: &mut crate::daemon::State, machine: Machine) -> Choice {
                     ..
                 }
             )
+            && machine.pressure.is_some_and(|p| p < RELAX_PRESSURE)
         {
-            match relax(&cfg, &machine, job.status.blocked_since, now) {
+            let since = match prev_calm {
+                Some((calm_id, since)) if calm_id == id => since,
+                _ => now,
+            };
+            calm_head = Some((id, since));
+            match relax(&cfg, reserve, since, now) {
                 Relax::Off => {}
                 Relax::Now { floor, waited } => {
                     outcome = verdict(
                         &cfg, &pools, &job.spec, claim_cpu, claim_mem, &held, &machine, floor,
                         quiet,
                     );
-                    if matches!(outcome, Verdict::Start) {
-                        relaxed = Some(format!(
-                            "qex lowered the reserve from {} to {} for this job: it waited {} at \
-                             the front of the queue, and the memory pressure was {:.1}.",
-                            format_size(reserve),
-                            format_size(floor),
-                            format_duration(waited),
-                            machine.pressure.unwrap_or(0.0)
-                        ));
+                    match &mut outcome {
+                        Verdict::Start => {
+                            relaxed = Some(format!(
+                                "qex lowered the reserve from {} to {} for this job: it waited {} \
+                                 at the front of the queue while the memory pressure stayed \
+                                 below {RELAX_PRESSURE:.1}.",
+                                format_size(reserve),
+                                format_size(floor),
+                                format_duration(waited),
+                            ));
+                        }
+                        Verdict::Wait { reason, .. } => reason.push_str(&format!(
+                            " qex already uses `reserve_floor` ({}) for this job, so a lower \
+                             `reserve_mem` changes nothing; a smaller claim or a smaller \
+                             `reserve_floor` lets it start.",
+                            format_size(floor)
+                        )),
                     }
                 }
-                Relax::Later { floor, after, left } => {
+                Relax::Later { floor, after } => {
                     if let Verdict::Wait { reason, .. } = &mut outcome {
                         reason.push_str(&format!(
                             " qex lowers the reserve of this job to {} when it has waited {} at \
-                             the front of the queue and the memory pressure stays below \
-                             {RELAX_PRESSURE:.1}: {} from now.",
+                             the front of the queue while the memory pressure stays below \
+                             {RELAX_PRESSURE:.1}.",
                             format_size(floor),
                             format_duration(after),
-                            format_duration(left)
                         ));
                     }
                 }
@@ -1857,6 +1860,8 @@ fn choose_on(state: &mut crate::daemon::State, machine: Machine) -> Choice {
     // its own, so nothing else tells the waiters. Measured before this count
     // existed: `qex wait` on a job whose dependency expired returned at 33.0s
     // with a 3s limit, and on a job whose dependency was cancelled at 31.0s.
+    state.calm_head = calm_head.filter(|(id, _)| Some(*id) != chosen);
+
     let mut finished = to_skip.len();
     for (id, reason, root) in to_skip {
         skip(state, id, reason, root);
@@ -2420,41 +2425,44 @@ mod tests {
     }
 
     #[test]
-    fn the_reserve_falls_only_after_the_wait_and_only_at_low_pressure() {
+    fn the_reserve_falls_only_after_the_calm_wait() {
         let cfg = cfg_relaxing();
-        let calm = machine_with(1 << 30, Some(0.0));
+        let reserve = cfg.reserve_mem().unwrap();
         let now = 10_000;
 
         assert_eq!(
-            relax(&cfg, &calm, Some(now - 600), now),
+            relax(&cfg, reserve, now - 600, now),
             Relax::Now {
                 floor: 512 << 20,
                 waited: Duration::from_secs(600)
             }
         );
         assert_eq!(
-            relax(&cfg, &calm, Some(now - 60), now),
+            relax(&cfg, reserve, now - 60, now),
             Relax::Later {
                 floor: 512 << 20,
-                after: Duration::from_secs(600),
-                left: Duration::from_secs(540)
+                after: Duration::from_secs(600)
             }
         );
-        // The first pass at the front has no `blocked_since` yet.
-        assert!(matches!(relax(&cfg, &calm, None, now), Relax::Later { .. }));
-
-        let pressed = machine_with(1 << 30, Some(RELAX_PRESSURE));
-        assert_eq!(relax(&cfg, &pressed, Some(0), now), Relax::Off);
-        let unknown = machine_with(1 << 30, None);
-        assert_eq!(relax(&cfg, &unknown, Some(0), now), Relax::Off);
 
         let mut off = cfg_relaxing();
         off.system.reserve_relax_after = "0".into();
-        assert_eq!(relax(&off, &calm, Some(0), now), Relax::Off);
+        assert_eq!(relax(&off, reserve, 0, now), Relax::Off);
 
         let mut floor_too_high = cfg_relaxing();
         floor_too_high.system.reserve_floor = "2GB".into();
-        assert_eq!(relax(&floor_too_high, &calm, Some(0), now), Relax::Off);
+        assert_eq!(relax(&floor_too_high, reserve, 0, now), Relax::Off);
+    }
+
+    #[test]
+    fn a_bare_number_is_a_wait_in_seconds() {
+        let c: Config = toml::from_str("[system]\nreserve_relax_after = 600\n").unwrap();
+        assert_eq!(
+            c.reserve_relax_after().unwrap(),
+            Some(Duration::from_secs(600))
+        );
+        let off: Config = toml::from_str("[system]\nreserve_relax_after = 0\n").unwrap();
+        assert_eq!(off.reserve_relax_after().unwrap(), None);
     }
 
     #[test]
@@ -2466,23 +2474,26 @@ mod tests {
 
     /// A job of 1GB at the front, on a machine with 2GB available: the full
     /// reserve of 2GB stops it, and the floor of 512MB lets it start.
-    fn state_with_front_of_1gb(blocked_since: Option<u64>) -> (crate::daemon::State, uuid::Uuid) {
+    fn state_with_front_of_1gb() -> (crate::daemon::State, uuid::Uuid) {
         let mut state = state_with(JobState::Running, None, 0);
         state.queue.clear();
         state.jobs.clear();
         state.cfg = cfg_relaxing();
         let front = add_job(&mut state, JobState::Queued, 1, None, 0);
-        let job = state.jobs.get_mut(&front).unwrap();
-        job.status.mem = 1 << 30;
-        job.status.blocked_since = blocked_since;
+        state.jobs.get_mut(&front).unwrap().status.mem = 1 << 30;
         (state, front)
     }
 
-    #[test]
-    fn the_front_job_starts_with_the_floor_after_the_wait_and_says_so() {
-        let (mut state, front) = state_with_front_of_1gb(Some(sys::now_secs() - 601));
+    fn calm() -> Machine {
+        machine_with(2 << 30, Some(0.0))
+    }
 
-        let choice = choose_on(&mut state, machine_with(2 << 30, Some(0.0)));
+    #[test]
+    fn the_front_job_starts_with_the_floor_after_the_calm_wait_and_says_so() {
+        let (mut state, front) = state_with_front_of_1gb();
+        state.calm_head = Some((front, sys::now_secs() - 601));
+
+        let choice = choose_on(&mut state, calm());
 
         assert_eq!(choice.start, Some(front));
         let why = choice.relaxed.expect("a start with the floor must say so");
@@ -2490,36 +2501,76 @@ mod tests {
     }
 
     #[test]
-    fn the_front_job_waits_before_the_wait_is_over_and_says_when_it_starts() {
-        let (mut state, front) = state_with_front_of_1gb(Some(sys::now_secs() - 60));
+    fn the_calm_wait_begins_at_the_first_calm_pass_and_the_reason_stays_the_same() {
+        let (mut state, front) = state_with_front_of_1gb();
+        state.jobs.get_mut(&front).unwrap().status.blocked_since = Some(0);
 
-        let choice = choose_on(&mut state, machine_with(2 << 30, Some(0.0)));
-
-        assert_eq!(choice.start, None);
-        assert_eq!(choice.relaxed, None);
+        let first = choose_on(&mut state, calm());
+        assert_eq!(first.start, None);
+        let (calm_id, since) = state.calm_head.expect("the calm wait must begin");
+        assert_eq!(calm_id, front);
+        assert!(sys::now_secs() - since <= 1);
         let reason = state.jobs[&front].status.blocked_reason.clone().unwrap();
         assert!(reason.contains("lowers the reserve"), "got: {reason}");
+
+        choose_on(&mut state, calm());
+        assert_eq!(state.calm_head, Some((front, since)));
+        assert_eq!(
+            state.jobs[&front].status.blocked_reason.as_deref(),
+            Some(reason.as_str()),
+            "a reason that changes on each pass rewrites the record on each pass"
+        );
     }
 
     #[test]
-    fn the_front_job_keeps_the_full_reserve_under_pressure() {
-        let (mut state, front) = state_with_front_of_1gb(Some(0));
+    fn pressure_restarts_the_calm_wait() {
+        let (mut state, front) = state_with_front_of_1gb();
+        state.calm_head = Some((front, 0));
 
         let choice = choose_on(&mut state, machine_with(2 << 30, Some(5.0)));
 
         assert_eq!(choice.start, None);
+        assert_eq!(state.calm_head, None);
         let reason = state.jobs[&front].status.blocked_reason.clone().unwrap();
         assert!(!reason.contains("lowers the reserve"), "got: {reason}");
     }
 
     #[test]
+    fn a_new_front_job_starts_its_own_calm_wait() {
+        let (mut state, front) = state_with_front_of_1gb();
+        state.calm_head = Some((uuid::Uuid::new_v4(), 0));
+
+        let choice = choose_on(&mut state, calm());
+
+        assert_eq!(choice.start, None);
+        assert_eq!(state.calm_head.map(|(id, _)| id), Some(front));
+    }
+
+    #[test]
+    fn a_job_that_still_does_not_fit_at_the_floor_says_that_the_floor_is_in_use() {
+        let (mut state, front) = state_with_front_of_1gb();
+        state.calm_head = Some((front, 0));
+
+        let choice = choose_on(&mut state, machine_with(1 << 30, Some(0.0)));
+
+        assert_eq!(choice.start, None);
+        let reason = state.jobs[&front].status.blocked_reason.clone().unwrap();
+        assert!(
+            reason.contains("already uses `reserve_floor`"),
+            "got: {reason}"
+        );
+    }
+
+    #[test]
     fn a_job_that_fits_starts_with_no_mark() {
-        let (mut state, front) = state_with_front_of_1gb(Some(0));
+        let (mut state, front) = state_with_front_of_1gb();
+        state.calm_head = Some((front, 0));
 
         let choice = choose_on(&mut state, machine_with(8 << 30, Some(0.0)));
 
         assert_eq!(choice.start, Some(front));
         assert_eq!(choice.relaxed, None);
+        assert_eq!(state.calm_head, None);
     }
 
     /// A paused queue must expire NO job.
@@ -2728,6 +2779,7 @@ mod tests {
             paused: crate::pause::Paused::default(),
             last_start_at: None,
             head: None,
+            calm_head: None,
             peer_claims: Default::default(),
             stop: false,
         }

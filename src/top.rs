@@ -1385,7 +1385,10 @@ fn note_for(job: &JobStatus) -> String {
         return reason.clone();
     }
     if job.forced {
-        return "FORCED: larger than the budget".to_string();
+        return match &job.forced_reason {
+            Some(why) => format!("FORCED: {why}"),
+            None => "FORCED: larger than the budget".to_string(),
+        };
     }
     match job.state {
         JobState::Completed => "ok".to_string(),

@@ -260,6 +260,9 @@ pub struct State {
     /// used for its decision.
     pub peer_claims: crate::peers::Claims,
     pub stop: bool,
+    /// The job at the front that waits for memory at low pressure, and the
+    /// time when that wait began.
+    pub calm_head: Option<(uuid::Uuid, u64)>,
 }
 
 /// The job at the front of the queue that cannot start, for `qex info`.
@@ -592,6 +595,7 @@ impl State {
             paused: crate::pause::Paused::default(),
             last_start_at: None,
             head: None,
+            calm_head: None,
             peer_claims: crate::peers::Claims::default(),
             stop: false,
         }
@@ -1004,6 +1008,7 @@ impl Coordinator {
                 paused: crate::pause::Paused::default(),
                 last_start_at: None,
                 head: None,
+                calm_head: None,
                 peer_claims: crate::peers::Claims::default(),
                 stop: false,
             }),
@@ -3310,6 +3315,7 @@ mod tests {
             paused: crate::pause::Paused::default(),
             last_start_at: None,
             head: None,
+            calm_head: None,
             peer_claims: Default::default(),
             stop: false,
             config_seen: 0,

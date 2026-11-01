@@ -423,6 +423,7 @@ pub struct SystemConfig {
     pub max_pressure: f64,
     /// The wait at the front of the queue after which the reserve falls to
     /// `reserve_floor`. `0` keeps the full reserve for ever.
+    #[serde(deserialize_with = "text_or_number")]
     pub reserve_relax_after: String,
     /// The reserve for a job that waited `reserve_relax_after` at the front of
     /// the queue while the memory pressure stayed below [`RELAX_PRESSURE`].

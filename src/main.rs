@@ -841,12 +841,12 @@ fn print_config_summary(cfg: &config::Config) -> Result<()> {
         "keep free:    {} of memory{}",
         units::format_size(cfg.reserve_mem()?),
         match cfg.reserve_relax_after()? {
-            Some(d) => format!(
+            Some(d) if cfg.reserve_floor()? < cfg.reserve_mem()? => format!(
                 "; {} for the job at the front after it waits {} at low memory pressure",
                 units::format_size(cfg.reserve_floor()?),
                 units::format_duration(d)
             ),
-            None => String::new(),
+            _ => String::new(),
         }
     );
     println!(
