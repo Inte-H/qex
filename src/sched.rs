@@ -882,6 +882,9 @@ enum Relax {
     },
 }
 
+/// The first words of the `forced_reason` of a job that started with the floor.
+pub const RELAXED_START: &str = "qex lowered the reserve";
+
 fn relax(cfg: &Config, reserve: u64, calm_since: u64, now: u64) -> Relax {
     let (Ok(Some(after)), Ok(floor)) = (cfg.reserve_relax_after(), cfg.reserve_floor()) else {
         return Relax::Off;
@@ -1729,6 +1732,7 @@ fn choose_on(state: &mut crate::daemon::State, machine: Machine) -> Choice {
                     ..
                 }
             )
+            && machine.available < reserve.saturating_add(claim_mem)
             && machine.pressure.is_some_and(|p| p < RELAX_PRESSURE)
         {
             let since = match prev_calm {
@@ -1746,7 +1750,7 @@ fn choose_on(state: &mut crate::daemon::State, machine: Machine) -> Choice {
                     match &mut outcome {
                         Verdict::Start => {
                             relaxed = Some(format!(
-                                "qex lowered the reserve from {} to {} for this job: it waited {} \
+                                "{RELAXED_START} from {} to {} for this job: it waited {} \
                                  at the front of the queue while the memory pressure stayed \
                                  below {RELAX_PRESSURE:.1}.",
                                 format_size(reserve),
@@ -1860,7 +1864,10 @@ fn choose_on(state: &mut crate::daemon::State, machine: Machine) -> Choice {
     // its own, so nothing else tells the waiters. Measured before this count
     // existed: `qex wait` on a job whose dependency expired returned at 33.0s
     // with a 3s limit, and on a job whose dependency was cancelled at 31.0s.
-    state.calm_head = calm_head.filter(|(id, _)| Some(*id) != chosen);
+    // A paused pass tests no job, so it leaves the calm wait as it was.
+    if paused.is_none() {
+        state.calm_head = calm_head;
+    }
 
     let mut finished = to_skip.len();
     for (id, reason, root) in to_skip {
@@ -2559,6 +2566,36 @@ mod tests {
             reason.contains("already uses `reserve_floor`"),
             "got: {reason}"
         );
+    }
+
+    #[test]
+    fn a_pause_and_an_aborted_start_keep_the_calm_wait() {
+        let (mut state, front) = state_with_front_of_1gb();
+        state
+            .paused
+            .add_queue(crate::pause::PauseRecord::new(1, None, None));
+        state.calm_head = Some((front, 7));
+
+        choose_on(&mut state, calm());
+        assert_eq!(state.calm_head, Some((front, 7)));
+
+        state.paused = Default::default();
+        let choice = choose_on(&mut state, calm());
+        assert_eq!(choice.start, Some(front));
+        // `start_job` can still refuse the job, which then stays in the queue.
+        assert_eq!(state.calm_head, Some((front, 7)));
+    }
+
+    #[test]
+    fn a_wait_for_the_pressure_limit_is_not_a_calm_wait() {
+        let (mut state, front) = state_with_front_of_1gb();
+        state.cfg.system.max_pressure = 0.5;
+
+        choose_on(&mut state, machine_with(8 << 30, Some(0.7)));
+
+        assert_eq!(state.calm_head, None);
+        let reason = state.jobs[&front].status.blocked_reason.clone().unwrap();
+        assert!(!reason.contains("reserve"), "got: {reason}");
     }
 
     #[test]

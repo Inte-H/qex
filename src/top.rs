@@ -1386,8 +1386,10 @@ fn note_for(job: &JobStatus) -> String {
     }
     if job.forced {
         return match &job.forced_reason {
-            Some(why) => format!("FORCED: {why}"),
-            None => "FORCED: larger than the budget".to_string(),
+            Some(why) if why.starts_with(crate::sched::RELAXED_START) => {
+                "FORCED: lower reserve after a calm wait".to_string()
+            }
+            _ => "FORCED: larger than the budget".to_string(),
         };
     }
     match job.state {
