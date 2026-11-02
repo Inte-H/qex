@@ -1045,6 +1045,8 @@ pub fn run(coord: Arc<Coordinator>) {
         // signature. Do not read a surviving mutant here as a hole in the tests,
         // and do not add a test that counts wakeups to close it: that test would
         // pin an economy, not a promise, and it would fail on a busy machine.
+        measure_use(&coord);
+
         match step(&coord) {
             Ok((started, finished)) if started > 0 || finished > 0 || changed => coord.notify(),
             Ok(_) => {}
@@ -1104,6 +1106,49 @@ pub fn run(coord: Arc<Coordinator>) {
         };
         let _ = coord.changed.wait_timeout(state, wait).unwrap();
     }
+}
+
+fn measure_use(coord: &Arc<Coordinator>) {
+    let now = Instant::now();
+    let (jobs, below) = {
+        let mut state = coord.state.lock().unwrap();
+        if !matches!(state.cfg.claim_relax_after(), Ok(Some(_))) {
+            state.relax.clear();
+            return;
+        }
+        if !state.relax.due(now) {
+            return;
+        }
+        let jobs: Vec<(uuid::Uuid, u64, i32)> = state
+            .jobs
+            .iter()
+            .filter(|(_, job)| job.status.state.is_active())
+            .filter_map(|(id, job)| job.status.pid.map(|pid| (*id, job.status.cpu, pid)))
+            .collect();
+        (jobs, state.cfg.claim_relax_below())
+    };
+
+    let observed: Vec<crate::relax::Observed> = jobs
+        .into_iter()
+        .filter_map(|(id, claim, pid)| {
+            let usage = sys::group_usage(pid);
+            // A group that qex cannot read says nothing about the use, and a
+            // job without a measurement must keep its whole claim.
+            (usage.processes > 0).then(|| crate::relax::Observed {
+                id,
+                claim,
+                pid,
+                cpu_secs: usage.cpu_secs + usage.reaped_cpu_secs,
+            })
+        })
+        .collect();
+
+    coord
+        .state
+        .lock()
+        .unwrap()
+        .relax
+        .observe(now, below, &observed);
 }
 
 /// Starts each job that can start now.
@@ -1545,7 +1590,7 @@ struct Head {
 /// head start while the head cannot. The head keeps its place, and it starts
 /// before every job behind it as soon as it can start.
 fn choose(state: &mut crate::daemon::State) -> Choice {
-    let held = state.claimed();
+    let held = state.claimed_for_admission();
     let cfg = state.cfg.clone();
     // A config file that qex cannot read gives no pool. Every claim then falls
     // back to a pool of one unit, which is a lock, and no job gets a device it
@@ -1874,7 +1919,7 @@ fn start_job(coord: &Arc<Coordinator>, id: uuid::Uuid) -> anyhow::Result<()> {
     //
     // This code uses no `expect` on the map. A panic here occurs while this
     // thread holds the lock, which poisons the lock and stops the coordinator.
-    let (forced_reason, name, status) = {
+    let (forced_reason, name, status, reclaimed) = {
         let mut state = coord.state.lock().unwrap();
 
         let Some(job) = state.jobs.get(&id) else {
@@ -1921,6 +1966,12 @@ fn start_job(coord: &Arc<Coordinator>, id: uuid::Uuid) -> anyhow::Result<()> {
             )),
             Size::Fits => None,
         };
+        // The cores that this job took from the claims of jobs that use little.
+        let budget = state.cfg.budget_cpu().unwrap_or(1);
+        let reclaimed = state
+            .reclaimed_cpu()
+            .min(job.status.cpu)
+            .min((state.claimed().cpu + job.status.cpu).saturating_sub(budget));
 
         // Give the devices INSIDE this lock hold, before the record is written
         // and before the fork.
@@ -1975,7 +2026,7 @@ fn start_job(coord: &Arc<Coordinator>, id: uuid::Uuid) -> anyhow::Result<()> {
         // started nothing for a long time is the fault that a reader looks for.
         state.last_start_at = Some(sys::now_secs());
         state.publish_changes();
-        (forced, name, status)
+        (forced, name, status, reclaimed)
     };
 
     // Write the record after the change in memory, and before the fork.
@@ -2000,6 +2051,13 @@ fn start_job(coord: &Arc<Coordinator>, id: uuid::Uuid) -> anyhow::Result<()> {
     if let Some(reason) = &forced_reason {
         log(&format!(
             "job {id} ({name}) starts although it is too large: {reason}"
+        ));
+    }
+    if reclaimed > 0 {
+        log(&format!(
+            "job {id} ({name}) starts on {} that operating jobs claim and do not use \
+             ([system] claim_relax_after)",
+            cores(reclaimed)
         ));
     }
 
@@ -2507,6 +2565,7 @@ mod tests {
             last_start_at: None,
             head: None,
             peer_claims: Default::default(),
+            relax: Default::default(),
             stop: false,
         }
     }
@@ -2558,6 +2617,63 @@ mod tests {
             state.queue.push(id);
         }
         id
+    }
+
+    fn add_running_job(state: &mut crate::daemon::State, cpu: u64, pid: i32) -> uuid::Uuid {
+        let spec = spec_with(cpu, 1 << 20);
+        let id = spec.id;
+        let mut status = crate::job::JobStatus::new(&spec);
+        status.state = JobState::Running;
+        status.pid = Some(pid);
+        status.submitted_at = sys::now_secs();
+        state.jobs.insert(
+            id,
+            crate::daemon::Job {
+                spec,
+                status: status.into(),
+                supervisor_pid: None,
+            },
+        );
+        id
+    }
+
+    #[test]
+    fn jobs_that_use_little_of_their_cores_leave_room_for_a_third_job() {
+        let ago = |secs| {
+            Instant::now()
+                .checked_sub(Duration::from_secs(secs))
+                .unwrap()
+        };
+        let fill = |relax_after: &str| {
+            let mut state = state_with(JobState::Running, None, 0);
+            state.queue.clear();
+            state.jobs.clear();
+            state.cfg.system.claim_relax_after = relax_after.to_string();
+            let a = add_running_job(&mut state, 2, 10);
+            let b = add_running_job(&mut state, 2, 11);
+            let third = add_job(&mut state, JobState::Queued, 2, None, 0);
+            let idle: Vec<crate::relax::Observed> = [(a, 10), (b, 11)]
+                .into_iter()
+                .map(|(id, pid)| crate::relax::Observed {
+                    id,
+                    claim: 2,
+                    pid,
+                    cpu_secs: 0.0,
+                })
+                .collect();
+            for at in [ago(12), ago(6), ago(1)] {
+                state.relax.observe(at, 25.0, &idle);
+            }
+            (state, third)
+        };
+
+        let (mut off, _) = fill("0");
+        assert_eq!(choose(&mut off).start, None, "the rule is off by default");
+
+        let (mut on, third) = fill("10s");
+        assert_eq!(on.claimed().cpu, 4, "the claims themselves do not change");
+        assert_eq!(on.claimed_for_admission().cpu, 2);
+        assert_eq!(choose(&mut on).start, Some(third));
     }
 
     /// THE BYPASS, AND ITS BOUND, THROUGH `choose`.

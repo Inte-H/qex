@@ -834,6 +834,7 @@ mod tests {
             last_start_at: None,
             head: None,
             peer_claims: Default::default(),
+            relax: Default::default(),
             stop: false,
         }
     }

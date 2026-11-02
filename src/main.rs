@@ -77,6 +77,8 @@ mod pipeline;
 #[cfg(unix)]
 mod proto;
 #[cfg(unix)]
+mod relax;
+#[cfg(unix)]
 mod resolve;
 #[cfg(unix)]
 mod sched;
@@ -840,6 +842,18 @@ fn print_config_summary(cfg: &config::Config) -> Result<()> {
     println!(
         "keep free:    {} of memory",
         units::format_size(cfg.reserve_mem()?)
+    );
+    println!(
+        "reclaim:      {}",
+        match cfg.claim_relax_after()? {
+            Some(d) => format!(
+                "a job that uses less than {}% of its cores for {} holds only the cores that it \
+                 uses, before a job starts",
+                cfg.claim_relax_below(),
+                units::format_duration(d)
+            ),
+            None => "off; a job holds its whole claim until it stops".to_string(),
+        }
     );
     println!(
         "job output:   {}",

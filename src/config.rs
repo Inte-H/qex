@@ -421,6 +421,18 @@ pub struct SystemConfig {
     /// Linux supplies this measurement. macOS does not.
     #[serde(deserialize_with = "decimal_number")]
     pub max_pressure: f64,
+    /// How long a job must have operated below `claim_relax_below` before qex
+    /// counts the part of its claim that it does not use as free. With `0` qex
+    /// holds the whole claim until the job stops.
+    #[serde(deserialize_with = "text_or_number")]
+    pub claim_relax_after: String,
+    /// The use, as a percentage of the claim, below which qex reclaims.
+    ///
+    /// A job that uses less than this part of its claim for
+    /// `claim_relax_after` holds only the cores that it uses, rounded up, and
+    /// never less than one.
+    #[serde(deserialize_with = "decimal_number")]
+    pub claim_relax_below: f64,
 }
 
 impl Default for SystemConfig {
@@ -429,6 +441,8 @@ impl Default for SystemConfig {
             // EMPTY means "choose from `[enforce] mode`". See `reserve_mem`.
             reserve_mem: String::new(),
             max_pressure: 20.0,
+            claim_relax_after: "0".to_string(),
+            claim_relax_below: 25.0,
         }
     }
 }
@@ -1418,6 +1432,7 @@ impl Config {
             c.system.reserve_mem = crate::units::format_size(self.reserve_mem().unwrap_or(0));
         }
         c.peers.enabled = Some(self.peers_enabled());
+        c.system.claim_relax_below = self.claim_relax_below();
         c
     }
 
@@ -1455,6 +1470,19 @@ impl Config {
         units::parse_duration(&self.queue.settle)
             .map_err(|e| anyhow::anyhow!("config [queue] settle: {e}"))
             .map(|d| d.unwrap_or(std::time::Duration::ZERO))
+    }
+
+    /// Gives the time after which qex reclaims the part of a claim that a job
+    /// does not use. `None` means that qex never reclaims it.
+    pub fn claim_relax_after(&self) -> Result<Option<std::time::Duration>> {
+        units::parse_duration(&self.system.claim_relax_after)
+            .map_err(|e| anyhow::anyhow!("config [system] claim_relax_after: {e}"))
+    }
+
+    /// Gives the share of a claim, as a percentage, below which a job that
+    /// uses less holds only what it uses.
+    pub fn claim_relax_below(&self) -> f64 {
+        self.system.claim_relax_below.clamp(0.0, 100.0)
     }
 
     /// Gives the age of a record that `qex gc` deletes.
@@ -1775,6 +1803,7 @@ impl Config {
         self.budget_mem()?;
         self.reserve_mem()?;
         self.settle()?;
+        self.claim_relax_after()?;
         self.peer_stale_after()?;
         self.history_keep()?;
         self.gc_keep()?;

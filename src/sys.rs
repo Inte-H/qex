@@ -673,6 +673,10 @@ pub struct GroupUsage {
     pub rss: u64,
     /// The CPU time of every process of the group, in seconds.
     pub cpu_secs: f64,
+    /// A child that stops takes its time out of `cpu_secs`, and the kernel adds
+    /// that time here when its parent waits for it.
+    /// macOS gives no value, so this field is 0 there.
+    pub reaped_cpu_secs: f64,
     /// The number of processes in the group.
     pub processes: usize,
 }
@@ -721,9 +725,12 @@ pub fn group_usage(pgid: i32) -> GroupUsage {
 
         let utime: f64 = fields[11].parse().unwrap_or(0.0);
         let stime: f64 = fields[12].parse().unwrap_or(0.0);
+        let cutime: f64 = fields[13].parse().unwrap_or(0.0);
+        let cstime: f64 = fields[14].parse().unwrap_or(0.0);
         let rss_pages: u64 = fields[21].parse().unwrap_or(0);
 
         out.cpu_secs += (utime + stime) / ticks;
+        out.reaped_cpu_secs += (cutime + cstime) / ticks;
         out.rss += rss_pages * page;
         out.processes += 1;
     }
