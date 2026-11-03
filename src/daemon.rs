@@ -1668,6 +1668,7 @@ fn requeue_unstarted(status: &mut crate::job::JobStatus, supervisor_was_recorded
     status.assigned.clear();
     status.forced = false;
     status.forced_reason = None;
+    status.reclaimed_cpu = None;
     retire_the_pids(status);
     true
 }

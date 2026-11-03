@@ -532,6 +532,9 @@ asked for. Memory is never reclaimed: a job can return to its peak of memory at
 any moment. A job that used no CPU for a while can also wake up, so the budget
 is no longer a hard cap while the rule is on — qex may start one job more than
 the full claims would allow, and the two jobs that share a core are both slower.
+A job that starts on such cores records their number in the status field
+`reclaimed_cpu`, and `qex status` gives a `reclaimed:` line, so the reader of a
+slow job can see that it shares cores.
 
 ## A submission that a script can repeat
 

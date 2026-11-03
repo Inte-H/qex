@@ -1492,6 +1492,7 @@ mod tests {
             usage: Usage::default(),
             forced: false,
             forced_reason: None,
+            reclaimed_cpu: None,
             queue_pause_secs: 0,
             blocked_reason: None,
             blocked_since: None,

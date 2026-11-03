@@ -2022,6 +2022,7 @@ fn start_job(coord: &Arc<Coordinator>, id: uuid::Uuid) -> anyhow::Result<()> {
         job.status.passed_by = 0;
         job.status.forced = forced.is_some();
         job.status.forced_reason = forced.clone();
+        job.status.reclaimed_cpu = (reclaimed > 0).then_some(reclaimed);
         let status = job.status.clone();
         // The SAFE name: this value goes into the log of the coordinator.
         let name = crate::job::safe_name(&job.spec.name);

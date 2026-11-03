@@ -404,6 +404,10 @@ pub const STATUS: &str = r##"{
       "type": ["string", "null"],
       "description": "The reason for a forced start."
     },
+    "reclaimed_cpu": {
+      "type": ["integer", "null"],
+      "description": "The cores of the claim that came from the claims of jobs that operate and use little ([system] claim_relax_after). Null when the job started inside the budget. A job that is busy again shares these cores with this job."
+    },
     "queue_pause_secs": {
       "type": "integer",
       "description": "The seconds of the wait of this job that the queue was paused. --max-queue-time does not count them, so a pause does not expire a job."

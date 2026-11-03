@@ -6967,6 +6967,41 @@ fn a_long_runtime_directory_still_works() {
     std::fs::remove_dir_all(long.ancestors().nth(3).unwrap()).ok();
 }
 
+/// A job that starts on the cores of an idle job must say so in its status. A
+/// job that is busy again shares those cores with it, and an agent that reads
+/// only the status must find why its job is slow.
+#[test]
+fn a_job_that_starts_on_reclaimed_cores_says_so() {
+    let h = Harness::new(
+        "reclaimed",
+        "[budget]\ncpu = \"2\"\nmem = \"1GB\"\n\
+         [peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         claim_relax_after = \"1s\"\n",
+    );
+    let idle = h.submit(&[
+        "submit", "--cpu", "2", "--mem", "100MB", "--", "sleep", "60",
+    ]);
+    let late = h.submit(&["submit", "--cpu", "1", "--mem", "100MB", "--", "sleep", "1"]);
+    h.ok(&["wait", &late]);
+    let _ = h.qex(&["kill", &idle]);
+
+    let status = h.status_json(&late);
+    assert_eq!(status["reclaimed_cpu"], 1, "got: {status}");
+    let text = h.ok(&["status", &late]);
+    assert!(
+        text.contains("reclaimed: started on 1 of the cores"),
+        "got: {text}"
+    );
+
+    let first = h.status_json(&idle);
+    assert_eq!(
+        first["reclaimed_cpu"],
+        serde_json::Value::Null,
+        "got: {first}"
+    );
+}
+
 /// The measured use must appear in the status, so an agent can correct its
 /// claim. This value is the feedback that makes the next claim more accurate.
 #[test]
