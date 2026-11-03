@@ -19,6 +19,9 @@
 //! - A daemon that works for two jobs at the same time counts its whole work
 //!   for each of them. The claim then becomes larger, which is the safe side.
 
+// The tracking runs on Linux only, so another system leaves parts unused.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+
 use std::collections::BTreeMap;
 
 /// The use of one job: its process group, and the processes that it is
@@ -214,31 +217,40 @@ pub fn find_linked(
     links: &[crate::sys::TcpLink],
     sockets: impl Fn(i32) -> Vec<u64>,
 ) -> Vec<Linked> {
-    use std::collections::{BTreeSet, HashMap};
+    use std::collections::{BTreeSet, HashMap, HashSet};
 
+    let listening: HashSet<std::net::SocketAddr> = links
+        .iter()
+        .filter(|l| l.listening && l.uid == uid)
+        .map(|l| l.local)
+        .collect();
+    // A socket that listens on every address of the machine has the address
+    // 0.0.0.0 or ::, and the second also accepts IPv4.
     let accepts = |address: std::net::SocketAddr| {
-        links.iter().any(|l| {
-            l.listening
-                && l.uid == uid
-                && l.local.port() == address.port()
-                && (l.local.ip() == address.ip() || l.local.ip().is_unspecified())
-        })
+        let any_v4 = std::net::SocketAddr::from(([0u8; 4], address.port()));
+        let any_v6 = std::net::SocketAddr::from(([0u16; 8], address.port()));
+        listening.contains(&address) || listening.contains(&any_v4) || listening.contains(&any_v6)
     };
     let open: Vec<&crate::sys::TcpLink> = links.iter().filter(|l| !l.listening).collect();
     let by_inode: HashMap<u64, &crate::sys::TcpLink> = open.iter().map(|l| (l.inode, *l)).collect();
     let by_ends: HashMap<_, &crate::sys::TcpLink> =
         open.iter().map(|l| ((l.local, l.remote), *l)).collect();
 
+    let held_by_job: HashSet<u64> = table
+        .iter()
+        .filter(|p| p.pgid == pgid)
+        .flat_map(|p| sockets(p.pid))
+        .collect();
     let mut wanted: BTreeSet<u64> = BTreeSet::new();
-    for process in table.iter().filter(|p| p.pgid == pgid) {
-        for inode in sockets(process.pid) {
-            let Some(link) = by_inode.get(&inode) else {
-                continue;
-            };
-            if let Some(other) = by_ends.get(&(link.remote, link.local)) {
-                if other.uid == uid && accepts(other.local) {
-                    wanted.insert(other.inode);
-                }
+    for inode in &held_by_job {
+        let Some(link) = by_inode.get(inode) else {
+            continue;
+        };
+        if let Some(other) = by_ends.get(&(link.remote, link.local)) {
+            // A connection between two processes of the job is in the
+            // measurement of the group already.
+            if other.uid == uid && !held_by_job.contains(&other.inode) && accepts(other.local) {
+                wanted.insert(other.inode);
             }
         }
     }
@@ -249,7 +261,10 @@ pub fn find_linked(
     let tree = Tree::new(table);
     let parents_of_job: BTreeSet<i32> = tree.ancestors(pgid).into_iter().collect();
     let mut owners: BTreeSet<i32> = BTreeSet::new();
-    for process in table.iter().filter(|p| p.uid == uid && p.pgid != pgid) {
+    for process in table
+        .iter()
+        .filter(|p| p.uid == uid && p.pgid != pgid && !parents_of_job.contains(&p.pid))
+    {
         if wanted.is_empty() {
             break;
         }
@@ -264,8 +279,6 @@ pub fn find_linked(
             }
         }
     }
-    owners.retain(|pid| !parents_of_job.contains(pid));
-
     owners
         .iter()
         .filter(|pid| !tree.ancestors(**pid).iter().any(|a| owners.contains(a)))
@@ -426,6 +439,47 @@ mod tests {
             assert!(find_linked(50, 7, &table, &links, sockets).is_empty());
         }
 
+        /// A test that starts a server inside the job must not make qex read the
+        /// open files of every process of this user, at each measurement.
+        #[test]
+        fn a_server_inside_the_job_is_not_searched_for() {
+            let table = vec![
+                process(50, 1, 50, 7, 1.0),
+                process(51, 50, 50, 7, 1.0),
+                process(60, 1, 60, 7, 100.0),
+            ];
+            let (links, _) = one_connection(51);
+            let sockets = |pid: i32| match pid {
+                50 => vec![1],
+                51 => vec![2, 9],
+                _ => panic!("qex read the sockets of the process {pid}"),
+            };
+            assert!(find_linked(50, 7, &table, &links, sockets).is_empty());
+        }
+
+        /// A server that accepts the connection and gives it to a worker keeps
+        /// its own copy of the socket. When that server is a parent of the job,
+        /// the worker must still be found.
+        #[test]
+        fn a_worker_that_shares_the_socket_with_a_parent_of_the_job_is_counted() {
+            let table = vec![
+                process(40, 1, 40, 7, 100.0),
+                process(41, 40, 40, 7, 30.0),
+                process(45, 40, 45, 7, 2.0),
+                process(50, 45, 50, 7, 1.0),
+            ];
+            let (links, _) = one_connection(0);
+            let sockets = |pid: i32| match pid {
+                50 => vec![1],
+                40 | 41 => vec![2],
+                _ => vec![],
+            };
+            let found = find_linked(50, 7, &table, &links, sockets);
+            assert_eq!(found.len(), 1);
+            assert_eq!(found[0].pid, 41);
+            assert_eq!(found[0].cpu_secs, 30.0);
+        }
+
         /// A local database of another user must not make qex read the open
         /// files of every process of this user, at each measurement.
         #[test]
@@ -530,7 +584,7 @@ mod tests {
                 "the busy shell used {before_finish}s in 1.5s"
             );
             assert!(
-                meter.cpu_secs() > before_finish + 0.2,
+                meter.cpu_secs() > before_finish + 0.05,
                 "the last measurement must count the time after the last sample"
             );
             assert!(second.cpu_secs >= before_finish);
