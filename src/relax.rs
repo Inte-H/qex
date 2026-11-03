@@ -85,8 +85,7 @@ impl Relax {
                     let gap = now.duration_since(old.last.at);
                     match use_in_cores(&old.last, &sample) {
                         Some(cores)
-                            if gap <= SAMPLE_EVERY * 2
-                                && is_low(cores, job.claim, below) =>
+                            if gap <= SAMPLE_EVERY * 2 && is_low(cores, job.claim, below) =>
                         {
                             Track {
                                 last: sample,
