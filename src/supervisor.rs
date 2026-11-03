@@ -651,18 +651,30 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
     let (stop_meter, meter_stopped) = std::sync::mpsc::channel::<()>();
     let meter = cfg!(target_os = "linux").then(|| {
         std::thread::spawn(move || {
+            // A build connects in its first second, and the time before the
+            // first measurement that sees the connection is not counted, so
+            // the first ten seconds are measured each second.
             let mut daemons = crate::daemons::DaemonUse::default();
             let mut peak = 0u64;
-            loop {
+            for round in 0u32.. {
                 let now = daemons.measure(pid);
                 if now.linked > 0 {
                     peak = peak.max(now.rss);
                 }
-                match meter_stopped.recv_timeout(crate::relax::SAMPLE_EVERY) {
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                    _ => return (daemons.cpu_secs(), peak),
+                let wait = if round < 10 {
+                    Duration::from_secs(1)
+                } else {
+                    crate::relax::SAMPLE_EVERY
+                };
+                if !matches!(
+                    meter_stopped.recv_timeout(wait),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    break;
                 }
             }
+            daemons.finish();
+            (daemons.cpu_secs(), peak)
         })
     });
 

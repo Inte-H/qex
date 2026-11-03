@@ -58,6 +58,7 @@ pub struct Linked {
 pub struct DaemonUse {
     last: BTreeMap<(i32, Option<u64>), f64>,
     cpu_secs: f64,
+    pgid: i32,
 }
 
 impl DaemonUse {
@@ -70,6 +71,7 @@ impl DaemonUse {
     /// to.
     #[cfg(target_os = "linux")]
     pub fn measure(&mut self, pgid: i32) -> JobUse {
+        self.pgid = pgid;
         let table = crate::sys::processes();
         let uid = unsafe { libc::getuid() };
         let links = crate::sys::tcp_links();
@@ -96,6 +98,28 @@ impl DaemonUse {
         }
     }
 
+    /// Measures again the processes that the last measurement saw connected,
+    /// after the job stopped. The connection closed with the job, but the
+    /// daemon did the work of the job until that moment, and a build that is
+    /// shorter than the time between two measurements would count nothing.
+    #[cfg(target_os = "linux")]
+    pub fn finish(&mut self) {
+        let table = crate::sys::processes();
+        let tree = Tree::new(&table);
+        let again: Vec<Linked> = self
+            .last
+            .keys()
+            .filter_map(|&(pid, start)| {
+                let root = tree.by_pid.get(&pid)?;
+                (root.start == start).then(|| tree.measure(root, self.pgid))
+            })
+            .collect();
+        self.observe(&again);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn finish(&mut self) {}
+
     pub fn observe(&mut self, linked: &[Linked]) {
         let mut next = BTreeMap::new();
         for process in linked {
@@ -113,13 +137,75 @@ impl DaemonUse {
     }
 }
 
-/// Finds the processes of user `uid`, outside the group `pgid`, that hold the
-/// other end of a TCP connection of the group, and measures each of them with
-/// its descendants.
+#[cfg(target_os = "linux")]
+struct Tree<'a> {
+    by_pid: std::collections::HashMap<i32, &'a crate::sys::ProcessUse>,
+    children: std::collections::HashMap<i32, Vec<i32>>,
+}
+
+#[cfg(target_os = "linux")]
+impl<'a> Tree<'a> {
+    fn new(table: &'a [crate::sys::ProcessUse]) -> Self {
+        let mut children: std::collections::HashMap<i32, Vec<i32>> = Default::default();
+        for process in table {
+            children.entry(process.ppid).or_default().push(process.pid);
+        }
+        Tree {
+            by_pid: table.iter().map(|p| (p.pid, p)).collect(),
+            children,
+        }
+    }
+
+    /// The parents of `pid`, up to the first process.
+    fn ancestors(&self, pid: i32) -> Vec<i32> {
+        let mut out = Vec::new();
+        let mut at = self.by_pid.get(&pid).map(|p| p.ppid);
+        while let Some(parent) = at {
+            if parent <= 0 || out.contains(&parent) || out.len() > self.by_pid.len() {
+                break;
+            }
+            out.push(parent);
+            at = self.by_pid.get(&parent).map(|p| p.ppid);
+        }
+        out
+    }
+
+    /// Measures `root` and its descendants. A process of the job group is
+    /// never counted, because the measurement of the group holds it.
+    fn measure(&self, root: &crate::sys::ProcessUse, pgid: i32) -> Linked {
+        let mut out = Linked {
+            pid: root.pid,
+            start: root.start,
+            cpu_secs: 0.0,
+            rss: 0,
+            processes: 0,
+        };
+        let mut todo = vec![root.pid];
+        while let Some(at) = todo.pop() {
+            let Some(process) = self.by_pid.get(&at) else {
+                continue;
+            };
+            if process.pgid == pgid {
+                continue;
+            }
+            out.cpu_secs += process.cpu_secs;
+            out.rss += process.rss;
+            out.processes += 1;
+            todo.extend(self.children.get(&at).into_iter().flatten().copied());
+        }
+        out
+    }
+}
+
+/// Finds the processes of user `uid`, outside the group `pgid`, that accept a
+/// TCP connection that the group opened, and measures each of them with its
+/// descendants.
 ///
+/// Only the side that accepts counts: a program that connects to a server of
+/// the job, such as a browser, does no work for the job. A parent of the job
+/// does not count either, because its descendants hold qex and the other jobs.
 /// A process that is a descendant of another connected process is counted once,
-/// inside the tree of that process. A process of the job group is never
-/// counted, because the measurement of the group holds it.
+/// inside the tree of that process.
 #[cfg(target_os = "linux")]
 pub fn find_linked(
     pgid: i32,
@@ -130,18 +216,28 @@ pub fn find_linked(
 ) -> Vec<Linked> {
     use std::collections::{BTreeSet, HashMap};
 
-    let by_inode: HashMap<u64, &crate::sys::TcpLink> = links.iter().map(|l| (l.inode, l)).collect();
-    let by_ends: HashMap<_, u64> = links
-        .iter()
-        .map(|l| ((l.local, l.remote), l.inode))
-        .collect();
+    let accepts = |address: std::net::SocketAddr| {
+        links.iter().any(|l| {
+            l.listening
+                && l.uid == uid
+                && l.local.port() == address.port()
+                && (l.local.ip() == address.ip() || l.local.ip().is_unspecified())
+        })
+    };
+    let open: Vec<&crate::sys::TcpLink> = links.iter().filter(|l| !l.listening).collect();
+    let by_inode: HashMap<u64, &crate::sys::TcpLink> = open.iter().map(|l| (l.inode, *l)).collect();
+    let by_ends: HashMap<_, &crate::sys::TcpLink> =
+        open.iter().map(|l| ((l.local, l.remote), *l)).collect();
 
     let mut wanted: BTreeSet<u64> = BTreeSet::new();
     for process in table.iter().filter(|p| p.pgid == pgid) {
         for inode in sockets(process.pid) {
-            if let Some(link) = by_inode.get(&inode) {
-                if let Some(&other) = by_ends.get(&(link.remote, link.local)) {
-                    wanted.insert(other);
+            let Some(link) = by_inode.get(&inode) else {
+                continue;
+            };
+            if let Some(other) = by_ends.get(&(link.remote, link.local)) {
+                if other.uid == uid && accepts(other.local) {
+                    wanted.insert(other.inode);
                 }
             }
         }
@@ -150,6 +246,8 @@ pub fn find_linked(
         return Vec::new();
     }
 
+    let tree = Tree::new(table);
+    let parents_of_job: BTreeSet<i32> = tree.ancestors(pgid).into_iter().collect();
     let mut owners: BTreeSet<i32> = BTreeSet::new();
     for process in table.iter().filter(|p| p.uid == uid && p.pgid != pgid) {
         if wanted.is_empty() {
@@ -166,55 +264,12 @@ pub fn find_linked(
             }
         }
     }
-
-    let by_pid: HashMap<i32, &crate::sys::ProcessUse> = table.iter().map(|p| (p.pid, p)).collect();
-    let mut children: HashMap<i32, Vec<i32>> = HashMap::new();
-    for process in table {
-        children.entry(process.ppid).or_default().push(process.pid);
-    }
-    let below_another = |pid: i32| {
-        let mut at = by_pid.get(&pid).map(|p| p.ppid);
-        let mut steps = 0;
-        while let Some(parent) = at {
-            if owners.contains(&parent) {
-                return true;
-            }
-            steps += 1;
-            if parent <= 1 || steps > table.len() {
-                return false;
-            }
-            at = by_pid.get(&parent).map(|p| p.ppid);
-        }
-        false
-    };
+    owners.retain(|pid| !parents_of_job.contains(pid));
 
     owners
         .iter()
-        .filter(|pid| !below_another(**pid))
-        .filter_map(|pid| {
-            let root = by_pid.get(pid)?;
-            let mut out = Linked {
-                pid: root.pid,
-                start: root.start,
-                cpu_secs: 0.0,
-                rss: 0,
-                processes: 0,
-            };
-            let mut todo = vec![root.pid];
-            while let Some(at) = todo.pop() {
-                let Some(process) = by_pid.get(&at) else {
-                    continue;
-                };
-                if process.pgid == pgid {
-                    continue;
-                }
-                out.cpu_secs += process.cpu_secs;
-                out.rss += process.rss;
-                out.processes += 1;
-                todo.extend(children.get(&at).into_iter().flatten().copied());
-            }
-            Some(out)
-        })
+        .filter(|pid| !tree.ancestors(**pid).iter().any(|a| owners.contains(a)))
+        .filter_map(|pid| Some(tree.measure(tree.by_pid.get(pid)?, pgid)))
         .collect()
 }
 
@@ -297,13 +352,25 @@ mod tests {
                 local: ([127, 0, 0, 1], local).into(),
                 remote: ([127, 0, 0, 1], remote).into(),
                 inode,
+                uid: 7,
+                listening: false,
+            }
+        }
+
+        fn listen(port: u16, inode: u64) -> TcpLink {
+            TcpLink {
+                local: ([0, 0, 0, 0], port).into(),
+                remote: ([0, 0, 0, 0], 0).into(),
+                inode,
+                uid: 7,
+                listening: true,
             }
         }
 
         /// The job group 50 holds socket 1. Its other end, socket 2, belongs to
-        /// the process `owner`.
+        /// the process `owner`, which accepted it on port 5000.
         fn one_connection(owner: i32) -> (Vec<TcpLink>, impl Fn(i32) -> Vec<u64>) {
-            let links = vec![link(40000, 5000, 1), link(5000, 40000, 2)];
+            let links = vec![link(40000, 5000, 1), link(5000, 40000, 2), listen(5000, 9)];
             let sockets = move |pid: i32| match pid {
                 50 => vec![1],
                 p if p == owner => vec![2],
@@ -337,6 +404,46 @@ mod tests {
         }
 
         #[test]
+        fn a_program_that_connects_to_a_server_of_the_job_is_not_counted() {
+            let table = vec![process(50, 1, 50, 7, 1.0), process(60, 1, 60, 7, 100.0)];
+            let links = vec![link(5000, 40000, 1), link(40000, 5000, 2), listen(5000, 9)];
+            let sockets = |pid: i32| match pid {
+                50 => vec![1, 9],
+                60 => vec![2],
+                _ => vec![],
+            };
+            assert!(find_linked(50, 7, &table, &links, sockets).is_empty());
+        }
+
+        #[test]
+        fn a_parent_of_the_job_is_not_counted() {
+            let table = vec![
+                process(40, 1, 40, 7, 100.0),
+                process(45, 40, 45, 7, 2.0),
+                process(50, 45, 50, 7, 1.0),
+            ];
+            let (links, sockets) = one_connection(40);
+            assert!(find_linked(50, 7, &table, &links, sockets).is_empty());
+        }
+
+        /// A local database of another user must not make qex read the open
+        /// files of every process of this user, at each measurement.
+        #[test]
+        fn a_server_of_another_user_is_not_searched_for() {
+            let table = vec![process(50, 1, 50, 7, 1.0), process(60, 1, 60, 7, 100.0)];
+            let mut other = link(5432, 40000, 2);
+            other.uid = 999;
+            let mut database = listen(5432, 9);
+            database.uid = 999;
+            let links = vec![link(40000, 5432, 1), other, database];
+            let sockets = |pid: i32| match pid {
+                50 => vec![1],
+                _ => panic!("qex read the sockets of the process {pid}"),
+            };
+            assert!(find_linked(50, 7, &table, &links, sockets).is_empty());
+        }
+
+        #[test]
         fn a_job_without_a_connection_has_no_daemon() {
             let table = vec![process(50, 1, 50, 7, 1.0), process(60, 1, 60, 7, 100.0)];
             let links = vec![link(5000, 40000, 2)];
@@ -363,6 +470,8 @@ mod tests {
                 link(5000, 40000, 2),
                 link(40001, 5001, 3),
                 link(5001, 40001, 4),
+                listen(5000, 8),
+                listen(5001, 9),
             ];
             let sockets = |pid: i32| match pid {
                 50 => vec![1, 3],
@@ -375,8 +484,9 @@ mod tests {
             assert_eq!(found[0].cpu_secs, 130.0);
         }
 
-        /// A real connection: a busy shell in a group of its own connects to a
-        /// socket that a job group holds.
+        /// A real connection, in the shape of a Gradle build: the job connects
+        /// to a port, and a busy shell in a group of its own holds the socket
+        /// that accepted the connection.
         #[test]
         fn a_busy_daemon_on_a_real_connection_counts_for_the_job() {
             use std::os::unix::process::CommandExt;
@@ -384,17 +494,16 @@ mod tests {
 
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let port = listener.local_addr().unwrap().port();
-            let mut daemon = Command::new("bash")
+            let mut job = Command::new("bash")
                 .arg("-c")
-                .arg(format!(
-                    "exec 3<>/dev/tcp/127.0.0.1/{port}; while :; do :; done"
-                ))
+                .arg(format!("exec 3<>/dev/tcp/127.0.0.1/{port}; sleep 30"))
                 .process_group(0)
                 .spawn()
                 .unwrap();
             let (stream, _) = listener.accept().unwrap();
-            let mut job = Command::new("sleep")
-                .arg("30")
+            let mut daemon = Command::new("bash")
+                .arg("-c")
+                .arg("while :; do :; done")
                 .stdin(Stdio::from(std::os::fd::OwnedFd::from(stream)))
                 .process_group(0)
                 .spawn()
@@ -405,6 +514,9 @@ mod tests {
             let first = meter.measure(pgid);
             std::thread::sleep(std::time::Duration::from_millis(1500));
             let second = meter.measure(pgid);
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let before_finish = meter.cpu_secs();
+            meter.finish();
 
             let _ = daemon.kill();
             let _ = job.kill();
@@ -412,13 +524,16 @@ mod tests {
             let _ = job.wait();
 
             assert_eq!(first.processes, 1);
-            assert_eq!(first.linked, 1, "the shell holds the other end");
+            assert_eq!(first.linked, 1, "the shell holds the socket that accepted");
             assert!(
-                meter.cpu_secs() > 0.5,
-                "the busy shell used {}s in 1.5s",
-                meter.cpu_secs()
+                before_finish > 0.5,
+                "the busy shell used {before_finish}s in 1.5s"
             );
-            assert!(second.cpu_secs >= meter.cpu_secs());
+            assert!(
+                meter.cpu_secs() > before_finish + 0.2,
+                "the last measurement must count the time after the last sample"
+            );
+            assert!(second.cpu_secs >= before_finish);
             assert!(second.rss > first.rss / 2);
         }
     }

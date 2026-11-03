@@ -6996,46 +6996,67 @@ fn the_status_gives_the_measured_use_of_a_job() {
 /// the work of the daemon, or the learned claim of a Gradle build becomes the
 /// smallest claim.
 ///
-/// Here the test process is the daemon: it accepts the connection of the job
-/// and keeps one core busy while the job sleeps.
+/// The job connects to a port of this test, and a busy shell in a group of its
+/// own holds the socket that accepted the connection, as a Gradle daemon does.
+/// The job is shorter than the usual time between two measurements, as a small
+/// build is.
 #[cfg(target_os = "linux")]
 #[test]
 fn the_work_of_a_connected_daemon_counts_as_the_use_of_the_job() {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::os::unix::process::CommandExt;
+
+    struct KillOnDrop(std::process::Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
 
     let h = Harness::with_default_config("daemon-use");
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
-    let done = std::sync::Arc::new(AtomicBool::new(false));
-    let daemon = {
-        let done = std::sync::Arc::clone(&done);
-        std::thread::spawn(move || {
-            let (_connection, _) = listener.accept().unwrap();
-            let mut spins = 0u64;
-            while !done.load(Ordering::Relaxed) {
-                spins = std::hint::black_box(spins.wrapping_add(1));
-            }
-        })
-    };
 
     let id = h.submit(&[
         "submit",
         "--",
         "bash",
         "-c",
-        &format!("exec 3<>/dev/tcp/127.0.0.1/{port}; sleep 12"),
+        &format!("exec 3<>/dev/tcp/127.0.0.1/{port}; sleep 4"),
     ]);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let stream = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(Instant::now() < deadline, "the job did not connect");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => panic!("accept failed: {e}"),
+        }
+    };
+    stream.set_nonblocking(false).unwrap();
+    let _daemon = KillOnDrop(
+        Command::new("bash")
+            .arg("-c")
+            .arg("while :; do :; done")
+            .stdin(std::process::Stdio::from(std::os::fd::OwnedFd::from(
+                stream,
+            )))
+            .process_group(0)
+            .spawn()
+            .unwrap(),
+    );
     h.ok(&["wait", &id]);
-    done.store(true, Ordering::Relaxed);
-    daemon.join().unwrap();
 
     let status = h.status_json(&id);
     assert_eq!(status["state"], "completed", "got: {status}");
     let cpu_secs = status["usage"]["cpu_secs"].as_f64().unwrap();
     assert!(
-        cpu_secs > 3.0,
-        "the daemon kept a core busy for 12s and qex measures every 5s, so the job must \
-         count more than 3s; got {cpu_secs:.3}s: {status}"
+        cpu_secs > 2.5,
+        "the daemon kept a core busy while the job ran for 4s, so the job must count \
+         more than 2.5s; got {cpu_secs:.3}s: {status}"
     );
 }
 

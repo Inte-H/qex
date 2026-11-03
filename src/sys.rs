@@ -667,7 +667,7 @@ mod tests {
 
     /// The first line is from `/proc/net/tcp`. The second is the other end of
     /// the same connection, through an IPv6 socket, as `/proc/net/tcp6` gives
-    /// it. The third is a socket that listens.
+    /// it. The last line of the first table is a socket that listens.
     #[cfg(target_os = "linux")]
     #[test]
     fn the_two_ends_of_a_connection_compare_equal_across_the_two_tables() {
@@ -678,10 +678,14 @@ mod tests {
                     20: 0000000000000000FFFF00000100007F:830B 0000000000000000FFFF00000100007F:B546 01 00000000:00000000 00:00000000 00000000  1001        0 220851 1 0000000000000000 20\n";
         let v4 = parse_tcp_table(tcp);
         let v6 = parse_tcp_table(tcp6);
-        assert_eq!(v4.len(), 1, "a socket that listens is not a connection");
+        assert_eq!(v4.len(), 2);
         assert_eq!(v4[0].local, "127.0.0.1:46406".parse().unwrap());
         assert_eq!(v4[0].remote, "127.0.0.1:33547".parse().unwrap());
         assert_eq!(v4[0].inode, 220857);
+        assert_eq!(v4[0].uid, 1001);
+        assert!(!v4[0].listening);
+        assert!(v4[1].listening);
+        assert_eq!(v4[1].local, "127.0.0.1:8080".parse().unwrap());
         assert_eq!(v6[0].local, v4[0].remote);
         assert_eq!(v6[0].remote, v4[0].local);
     }
@@ -858,9 +862,13 @@ pub struct TcpLink {
     pub local: std::net::SocketAddr,
     pub remote: std::net::SocketAddr,
     pub inode: u64,
+    /// The user that opened the socket.
+    pub uid: u32,
+    /// The socket waits for connections, and `remote` has no meaning.
+    pub listening: bool,
 }
 
-/// Reads the open TCP connections of the network of this process.
+/// Reads the TCP sockets of the network of this process.
 #[cfg(target_os = "linux")]
 pub fn tcp_links() -> Vec<TcpLink> {
     ["/proc/self/net/tcp", "/proc/self/net/tcp6"]
@@ -871,7 +879,7 @@ pub fn tcp_links() -> Vec<TcpLink> {
 }
 
 /// Reads one table of `/proc/net/tcp` or `/proc/net/tcp6`, and keeps the
-/// connections in the state ESTABLISHED.
+/// sockets in the state ESTABLISHED or LISTEN.
 ///
 /// A connection of IPv4 through an IPv6 socket has an address of the form
 /// `::ffff:a.b.c.d`, and the other end can be an IPv4 socket. Each such address
@@ -879,17 +887,20 @@ pub fn tcp_links() -> Vec<TcpLink> {
 #[cfg(target_os = "linux")]
 pub fn parse_tcp_table(text: &str) -> Vec<TcpLink> {
     const ESTABLISHED: &str = "01";
+    const LISTEN: &str = "0A";
     text.lines()
         .skip(1)
         .filter_map(|line| {
             let fields: Vec<&str> = line.split_whitespace().collect();
-            if fields.len() < 10 || fields[3] != ESTABLISHED {
+            if fields.len() < 10 || (fields[3] != ESTABLISHED && fields[3] != LISTEN) {
                 return None;
             }
             Some(TcpLink {
                 local: parse_tcp_address(fields[1])?,
                 remote: parse_tcp_address(fields[2])?,
                 inode: fields[9].parse().ok()?,
+                uid: fields[7].parse().ok()?,
+                listening: fields[3] == LISTEN,
             })
         })
         .collect()
