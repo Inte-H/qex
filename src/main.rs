@@ -43,6 +43,8 @@ mod config;
 mod context;
 #[cfg(unix)]
 mod daemon;
+#[cfg(unix)]
+mod daemons;
 mod deps;
 #[cfg(unix)]
 mod enforce;

@@ -835,6 +835,7 @@ mod tests {
             head: None,
             peer_claims: Default::default(),
             relax: Default::default(),
+            daemons: Default::default(),
             stop: false,
         }
     }

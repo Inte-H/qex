@@ -644,6 +644,40 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
     status.attempts += 1;
     job::write_status(&dir, &status)?;
 
+    // `RUSAGE_CHILDREN` holds only the children of this process. A job that
+    // gives its work to a daemon through a TCP connection, such as a Gradle
+    // build, would read as a job that uses nothing, so a thread measures the
+    // daemon while the job runs. See `crate::daemons`.
+    let (stop_meter, meter_stopped) = std::sync::mpsc::channel::<()>();
+    let meter = cfg!(target_os = "linux").then(|| {
+        std::thread::spawn(move || {
+            // A build connects in its first second, and the time before the
+            // first measurement that sees the connection is not counted, so
+            // the first ten seconds are measured each second.
+            let mut daemons = crate::daemons::DaemonUse::default();
+            let mut peak = 0u64;
+            for round in 0u32.. {
+                let now = daemons.measure(pid);
+                if now.linked > 0 {
+                    peak = peak.max(now.rss);
+                }
+                let wait = if round < 10 {
+                    Duration::from_secs(1)
+                } else {
+                    crate::relax::SAMPLE_EVERY
+                };
+                if !matches!(
+                    meter_stopped.recv_timeout(wait),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    break;
+                }
+            }
+            daemons.finish();
+            (daemons.cpu_secs(), peak)
+        })
+    });
+
     // The job and the timer race each other. This value records the winner.
     //
     // A simple flag is not sufficient here. The timer can fire in the moment
@@ -703,6 +737,10 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
             false
         }
     };
+
+    drop(stop_meter);
+    let (daemon_cpu_secs, peak_with_daemons) =
+        meter.and_then(|m| m.join().ok()).unwrap_or_default();
 
     // Take the race before the last signals. The timer can no longer start.
     let _ = outcome.compare_exchange(
@@ -787,7 +825,9 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
 
     // Read the resources that the job used. The values include each child of
     // the job, so a job that forks gives a correct measurement.
-    let usage = usage_since(&usage_before);
+    let mut usage = usage_since(&usage_before);
+    usage.cpu_secs += daemon_cpu_secs;
+    usage.max_rss = usage.max_rss.max(peak_with_daemons);
 
     let signal = exit_signal(&exit);
     let code = exit.code();
