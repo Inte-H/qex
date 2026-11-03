@@ -3074,6 +3074,7 @@ mod tests {
         );
         status.forced = true;
         status.forced_reason = Some("too large".into());
+        status.reclaimed_cpu = Some(2);
 
         assert!(requeue_unstarted(&mut status, false));
         assert_eq!(status.state, JobState::Queued);
@@ -3083,6 +3084,7 @@ mod tests {
         assert!(status.assigned.is_empty());
         assert!(!status.forced);
         assert_eq!(status.forced_reason, None);
+        assert_eq!(status.reclaimed_cpu, None);
 
         status.state = JobState::Running;
         assert!(!requeue_unstarted(&mut status, false));
