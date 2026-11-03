@@ -690,10 +690,14 @@ impl State {
         held
     }
 
-    pub fn claimed_for_admission(&self) -> crate::sched::Held {
+    /// The claims that the test before a job starts uses, and the cores that
+    /// the claims of idle jobs leave. One read of the measurements gives both,
+    /// so the two agree.
+    pub fn admission(&self) -> (crate::sched::Held, u64) {
         let mut held = self.claimed();
-        held.cpu = held.cpu.saturating_sub(self.reclaimed_cpu());
-        held
+        let relaxed = self.reclaimed_cpu();
+        held.cpu = held.cpu.saturating_sub(relaxed);
+        (held, relaxed)
     }
 
     pub fn reclaimed_cpu(&self) -> u64 {

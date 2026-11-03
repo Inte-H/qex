@@ -6990,7 +6990,7 @@ fn a_job_that_starts_on_reclaimed_cores_says_so() {
     assert_eq!(status["reclaimed_cpu"], 1, "got: {status}");
     let text = h.ok(&["status", &late]);
     assert!(
-        text.contains("reclaimed: 1 of its cores were claimed by idle jobs"),
+        text.contains("reclaimed: 1 of its cores were claimed by idle jobs when it started"),
         "got: {text}"
     );
 

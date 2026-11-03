@@ -406,7 +406,7 @@ pub const STATUS: &str = r##"{
     },
     "reclaimed_cpu": {
       "type": ["integer", "null"],
-      "description": "The cores of the claim that came from the claims of jobs that operate and use little ([system] claim_relax_after). Null when the job started inside the budget. A job that is busy again shares these cores with this job."
+      "description": "The cores of the claim that, when the job started, only the claims of jobs that operated and used little left free ([system] claim_relax_after). The claims of the other users count in that budget. Null when the job started on free cores. Such a job can be busy again and share these cores with this job while both run."
     },
     "queue_pause_secs": {
       "type": "integer",

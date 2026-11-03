@@ -713,7 +713,7 @@ fn admit(
     let (cpu_used, mem_used) = (held.cpu, held.mem);
 
     // Test 1: the budget of this user.
-    if cpu_used + cpu > cpu_budget {
+    if cores_over(cpu_used, cpu, cpu_budget) > 0 {
         return sibling_wait(
             format!(
                 "waits for cores: this job needs {}, and the jobs of this queue hold {} of the {} \
@@ -746,7 +746,7 @@ fn admit(
     // held the machine.
     let peers = &machine.peers;
     if peers.cpu > 0 || peers.mem > 0 {
-        if cpu_used + peers.cpu + cpu > cpu_budget {
+        if cores_over(cpu_used + peers.cpu, cpu, cpu_budget) > 0 {
             return Admit::No {
                 blocker: Blocker::Peer { count: peers.count },
                 reason: format!(
@@ -1597,8 +1597,7 @@ struct Head {
 /// head start while the head cannot. The head keeps its place, and it starts
 /// before every job behind it as soon as it can start.
 fn choose(state: &mut crate::daemon::State) -> Choice {
-    let held = state.claimed_for_admission();
-    let relaxed = state.reclaimed_cpu();
+    let (held, relaxed) = state.admission();
     let cfg = state.cfg.clone();
     // A config file that qex cannot read gives no pool. Every claim then falls
     // back to a pool of one unit, which is a lock, and no job gets a device it
@@ -1923,7 +1922,14 @@ fn choose(state: &mut crate::daemon::State) -> Choice {
 /// users. Only the claims of idle jobs, `relaxed` cores, let such a job start,
 /// so the answer is never more than that.
 fn reclaimed_cores(held: u64, cpu: u64, budget: u64, relaxed: u64) -> u64 {
-    (held + cpu).saturating_sub(budget).min(cpu).min(relaxed)
+    cores_over(held, cpu, budget).min(cpu).min(relaxed)
+}
+
+/// The cores of a job of `cpu` cores that do not fit in `budget` beside the
+/// `held` cores. The test before a job starts and the count of the reclaimed
+/// cores both use it, so the two agree.
+fn cores_over(held: u64, cpu: u64, budget: u64) -> u64 {
+    (held + cpu).saturating_sub(budget)
 }
 
 /// Starts the supervisor of one job.
@@ -2692,7 +2698,7 @@ mod tests {
 
         let (mut on, third) = fill("10s");
         assert_eq!(on.claimed().cpu, 4, "the claims themselves do not change");
-        assert_eq!(on.claimed_for_admission().cpu, 2);
+        assert_eq!(on.admission().0.cpu, 2);
         let choice = choose(&mut on);
         assert_eq!(choice.start, Some(third));
         assert_eq!(

@@ -549,9 +549,10 @@ pub struct JobStatus {
     /// The reason for a forced start, in text for a person to read.
     #[serde(default)]
     pub forced_reason: Option<String>,
-    /// The cores of the claim of this job that came from the claims of jobs
-    /// that operate and use little. `None` when the job started inside the
-    /// budget. A job that is busy again shares these cores with this job.
+    /// The cores of the claim of this job that, when it started, only the
+    /// claims of jobs that operated and used little left free. `None` when the
+    /// job started on free cores. Such a job can be busy again and share these
+    /// cores with this job while both run.
     #[serde(default)]
     pub reclaimed_cpu: Option<u64>,
     /// The seconds of the wait of this job that the QUEUE WAS PAUSED.

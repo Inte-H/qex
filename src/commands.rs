@@ -1447,11 +1447,11 @@ fn print_status(s: &JobStatus, show_env: bool) -> Result<()> {
     if let Some(n) = s.reclaimed_cpu {
         if s.state.is_active() {
             println!(
-                "reclaimed: {n} of its cores are claimed by idle jobs; a job that is busy again \
-                 shares them with this job"
+                "reclaimed: {n} of its cores were claimed by idle jobs when it started; such a \
+                 job can be busy again and share them with this job"
             );
         } else {
-            println!("reclaimed: {n} of its cores were claimed by idle jobs");
+            println!("reclaimed: {n} of its cores were claimed by idle jobs when it started");
         }
     }
     if let Some(r) = &s.blocked_reason {
