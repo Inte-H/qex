@@ -1444,6 +1444,16 @@ fn print_status(s: &JobStatus, show_env: bool) -> Result<()> {
             println!("           {r}");
         }
     }
+    if let Some(n) = s.reclaimed_cpu {
+        if s.state.is_active() {
+            println!(
+                "reclaimed: {n} of its cores were claimed by idle jobs when it started; such a \
+                 job can be busy again and share them with this job"
+            );
+        } else {
+            println!("reclaimed: {n} of its cores were claimed by idle jobs when it started");
+        }
+    }
     if let Some(r) = &s.blocked_reason {
         println!("waits for: {r}");
     }
@@ -7140,6 +7150,7 @@ mod tests {
             usage: Usage::default(),
             forced: false,
             forced_reason: None,
+            reclaimed_cpu: None,
             sequence: 0,
             queue_pause_secs: 0,
             blocked_reason: None,

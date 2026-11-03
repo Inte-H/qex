@@ -690,10 +690,13 @@ impl State {
         held
     }
 
-    pub fn claimed_for_admission(&self) -> crate::sched::Held {
+    /// The claims that the test before a job starts uses, and the cores that
+    /// the claims of idle jobs leave.
+    pub fn admission(&self) -> (crate::sched::Held, u64) {
         let mut held = self.claimed();
-        held.cpu = held.cpu.saturating_sub(self.reclaimed_cpu());
-        held
+        let relaxed = self.reclaimed_cpu();
+        held.cpu = held.cpu.saturating_sub(relaxed);
+        (held, relaxed)
     }
 
     pub fn reclaimed_cpu(&self) -> u64 {
@@ -1668,6 +1671,7 @@ fn requeue_unstarted(status: &mut crate::job::JobStatus, supervisor_was_recorded
     status.assigned.clear();
     status.forced = false;
     status.forced_reason = None;
+    status.reclaimed_cpu = None;
     retire_the_pids(status);
     true
 }
@@ -3073,6 +3077,7 @@ mod tests {
         );
         status.forced = true;
         status.forced_reason = Some("too large".into());
+        status.reclaimed_cpu = Some(2);
 
         assert!(requeue_unstarted(&mut status, false));
         assert_eq!(status.state, JobState::Queued);
@@ -3082,6 +3087,7 @@ mod tests {
         assert!(status.assigned.is_empty());
         assert!(!status.forced);
         assert_eq!(status.forced_reason, None);
+        assert_eq!(status.reclaimed_cpu, None);
 
         status.state = JobState::Running;
         assert!(!requeue_unstarted(&mut status, false));

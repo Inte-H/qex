@@ -713,7 +713,7 @@ fn admit(
     let (cpu_used, mem_used) = (held.cpu, held.mem);
 
     // Test 1: the budget of this user.
-    if cpu_used + cpu > cpu_budget {
+    if cores_over(cpu_used, cpu, cpu_budget) > 0 {
         return sibling_wait(
             format!(
                 "waits for cores: this job needs {}, and the jobs of this queue hold {} of the {} \
@@ -746,7 +746,7 @@ fn admit(
     // held the machine.
     let peers = &machine.peers;
     if peers.cpu > 0 || peers.mem > 0 {
-        if cpu_used + peers.cpu + cpu > cpu_budget {
+        if cores_over(cpu_used + peers.cpu, cpu, cpu_budget) > 0 {
             return Admit::No {
                 blocker: Blocker::Peer { count: peers.count },
                 reason: format!(
@@ -1202,7 +1202,7 @@ fn step(coord: &Arc<Coordinator>) -> anyhow::Result<(usize, usize)> {
 
         match choice.start {
             Some(id) => {
-                start_job(coord, id)?;
+                start_job(coord, id, choice.reclaimed)?;
                 started += 1;
             }
             None => break,
@@ -1527,6 +1527,9 @@ struct Choice {
     /// dependency expired at 3s returned at 33.0s, and on a job whose
     /// dependency was cancelled at 1s returned at 31.0s.
     finished: usize,
+    /// The cores of the job in `start` that only the claims of idle jobs left
+    /// free. See `reclaimed_cores`.
+    reclaimed: u64,
 }
 
 /// The job at the front of the queue that cannot start now.
@@ -1594,7 +1597,7 @@ struct Head {
 /// head start while the head cannot. The head keeps its place, and it starts
 /// before every job behind it as soon as it can start.
 fn choose(state: &mut crate::daemon::State) -> Choice {
-    let held = state.claimed_for_admission();
+    let (held, relaxed) = state.admission();
     let cfg = state.cfg.clone();
     // A config file that qex cannot read gives no pool. Every claim then falls
     // back to a pool of one unit, which is a lock, and no job gets a device it
@@ -1616,6 +1619,7 @@ fn choose(state: &mut crate::daemon::State) -> Choice {
     // Collect the decisions first. The loop cannot change the state while it
     // reads the jobs.
     let mut chosen = None;
+    let mut chosen_reclaimed = 0;
     let mut reasons: Vec<(uuid::Uuid, Option<String>)> = Vec::new();
     let mut to_skip: Vec<(uuid::Uuid, String, uuid::Uuid)> = Vec::new();
     // What each job waits for, when it is not capacity.
@@ -1729,6 +1733,12 @@ fn choose(state: &mut crate::daemon::State) -> Choice {
         ) {
             Verdict::Start => {
                 chosen = Some(id);
+                chosen_reclaimed = reclaimed_cores(
+                    held.cpu + relaxed + machine.peers.cpu,
+                    claim_cpu,
+                    cfg.budget_cpu().unwrap_or(1),
+                    relaxed,
+                );
                 started_now = Some(id);
                 break;
             }
@@ -1903,11 +1913,26 @@ fn choose(state: &mut crate::daemon::State) -> Choice {
     Choice {
         start: chosen,
         finished,
+        reclaimed: chosen_reclaimed,
     }
 }
 
+/// The cores of a job of `cpu` cores that are over the budget when every claim
+/// counts in full, with `held` the full claims of this user and of the other
+/// users. Only the claims of idle jobs, `relaxed` cores, let such a job start,
+/// so the answer is never more than that.
+fn reclaimed_cores(held: u64, cpu: u64, budget: u64, relaxed: u64) -> u64 {
+    cores_over(held, cpu, budget).min(cpu).min(relaxed)
+}
+
+/// The cores of a job of `cpu` cores that do not fit in `budget` beside the
+/// `held` cores.
+fn cores_over(held: u64, cpu: u64, budget: u64) -> u64 {
+    (held + cpu).saturating_sub(budget)
+}
+
 /// Starts the supervisor of one job.
-fn start_job(coord: &Arc<Coordinator>, id: uuid::Uuid) -> anyhow::Result<()> {
+fn start_job(coord: &Arc<Coordinator>, id: uuid::Uuid, reclaimed: u64) -> anyhow::Result<()> {
     // Take the job and test it again, with one lock only.
     //
     // The scheduler chose this job and then released the lock. In that moment,
@@ -1923,7 +1948,7 @@ fn start_job(coord: &Arc<Coordinator>, id: uuid::Uuid) -> anyhow::Result<()> {
     //
     // This code uses no `expect` on the map. A panic here occurs while this
     // thread holds the lock, which poisons the lock and stops the coordinator.
-    let (forced_reason, name, status, reclaimed) = {
+    let (forced_reason, name, status) = {
         let mut state = coord.state.lock().unwrap();
 
         let Some(job) = state.jobs.get(&id) else {
@@ -1970,12 +1995,6 @@ fn start_job(coord: &Arc<Coordinator>, id: uuid::Uuid) -> anyhow::Result<()> {
             )),
             Size::Fits => None,
         };
-        // The cores that this job took from the claims of jobs that use little.
-        let budget = state.cfg.budget_cpu().unwrap_or(1);
-        let reclaimed = state
-            .reclaimed_cpu()
-            .min(job.status.cpu)
-            .min((state.claimed().cpu + job.status.cpu).saturating_sub(budget));
 
         // Give the devices INSIDE this lock hold, before the record is written
         // and before the fork.
@@ -2022,6 +2041,7 @@ fn start_job(coord: &Arc<Coordinator>, id: uuid::Uuid) -> anyhow::Result<()> {
         job.status.passed_by = 0;
         job.status.forced = forced.is_some();
         job.status.forced_reason = forced.clone();
+        job.status.reclaimed_cpu = (reclaimed > 0).then_some(reclaimed);
         let status = job.status.clone();
         // The SAFE name: this value goes into the log of the coordinator.
         let name = crate::job::safe_name(&job.spec.name);
@@ -2030,7 +2050,7 @@ fn start_job(coord: &Arc<Coordinator>, id: uuid::Uuid) -> anyhow::Result<()> {
         // started nothing for a long time is the fault that a reader looks for.
         state.last_start_at = Some(sys::now_secs());
         state.publish_changes();
-        (forced, name, status, reclaimed)
+        (forced, name, status)
     };
 
     // Write the record after the change in memory, and before the fork.
@@ -2677,8 +2697,28 @@ mod tests {
 
         let (mut on, third) = fill("10s");
         assert_eq!(on.claimed().cpu, 4, "the claims themselves do not change");
-        assert_eq!(on.claimed_for_admission().cpu, 2);
-        assert_eq!(choose(&mut on).start, Some(third));
+        assert_eq!(on.admission().0.cpu, 2);
+        let choice = choose(&mut on);
+        assert_eq!(choice.start, Some(third));
+        assert_eq!(
+            choice.reclaimed, 2,
+            "the third job fits only on the idle cores"
+        );
+    }
+
+    /// The claims of the other users count in the budget, so a job can need the
+    /// idle cores of this user although this user alone stays inside it.
+    #[test]
+    fn the_reclaimed_cores_count_the_claims_of_the_other_users() {
+        // Budget 4, another user holds 2, an idle job of 2 cores counts as 1,
+        // and a job of 1 core starts: 1 + 2 + 1 = 4 fits.
+        assert_eq!(reclaimed_cores(2 + 2, 1, 4, 1), 1);
+        // Without the other user the same job fits on free cores.
+        assert_eq!(reclaimed_cores(2, 1, 4, 1), 0);
+        // Never more than the cores that the idle jobs leave.
+        assert_eq!(reclaimed_cores(8, 4, 4, 1), 1);
+        // Never more than the job.
+        assert_eq!(reclaimed_cores(8, 1, 4, 3), 1);
     }
 
     /// THE BYPASS, AND ITS BOUND, THROUGH `choose`.

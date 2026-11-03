@@ -549,6 +549,12 @@ pub struct JobStatus {
     /// The reason for a forced start, in text for a person to read.
     #[serde(default)]
     pub forced_reason: Option<String>,
+    /// The cores of the claim of this job that, when it started, only the
+    /// claims of jobs that operated and used little left free. `None` when the
+    /// job started on free cores. Such a job can be busy again and share these
+    /// cores with this job while both run.
+    #[serde(default)]
+    pub reclaimed_cpu: Option<u64>,
     /// The seconds of the wait of this job that the QUEUE WAS PAUSED.
     ///
     /// `--max-queue-time` says "the work has no value after this much time in
@@ -694,6 +700,7 @@ impl JobStatus {
             usage: Usage::default(),
             forced: false,
             forced_reason: None,
+            reclaimed_cpu: None,
             queue_pause_secs: 0,
             blocked_reason: None,
             blocked_since: None,
