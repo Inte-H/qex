@@ -259,6 +259,10 @@ pub struct State {
     /// users again. The answer then names the same numbers that the scheduler
     /// used for its decision.
     pub peer_claims: crate::peers::Claims,
+    /// The measured use of the jobs that operate. See `crate::relax`.
+    pub relax: crate::relax::Relax,
+    /// The work that each job gives to a daemon. See `crate::daemons`.
+    pub daemons: std::collections::BTreeMap<uuid::Uuid, crate::daemons::DaemonUse>,
     pub stop: bool,
 }
 
@@ -593,6 +597,8 @@ impl State {
             last_start_at: None,
             head: None,
             peer_claims: crate::peers::Claims::default(),
+            relax: Default::default(),
+            daemons: Default::default(),
             stop: false,
         }
     }
@@ -682,6 +688,27 @@ impl State {
             }
         }
         held
+    }
+
+    pub fn claimed_for_admission(&self) -> crate::sched::Held {
+        let mut held = self.claimed();
+        held.cpu = held.cpu.saturating_sub(self.reclaimed_cpu());
+        held
+    }
+
+    pub fn reclaimed_cpu(&self) -> u64 {
+        let Ok(Some(after)) = self.cfg.claim_relax_after() else {
+            return 0;
+        };
+        let now = Instant::now();
+        self.jobs
+            .iter()
+            .filter(|(_, job)| job.status.state.is_active())
+            .map(|(id, job)| {
+                let claim = job.status.cpu;
+                claim - self.relax.counted(id, claim, job.status.pid, after, now)
+            })
+            .sum()
     }
 
     /// Gives the job that holds this dedupe key now.
@@ -1005,6 +1032,8 @@ impl Coordinator {
                 last_start_at: None,
                 head: None,
                 peer_claims: crate::peers::Claims::default(),
+                relax: crate::relax::Relax::default(),
+                daemons: Default::default(),
                 stop: false,
             }),
             changed: Condvar::new(),
@@ -3311,6 +3340,8 @@ mod tests {
             last_start_at: None,
             head: None,
             peer_claims: Default::default(),
+            relax: Default::default(),
+            daemons: Default::default(),
             stop: false,
             config_seen: 0,
             config_settling: None,

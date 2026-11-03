@@ -6992,6 +6992,74 @@ fn the_status_gives_the_measured_use_of_a_job() {
     );
 }
 
+/// A job that gives its work to a daemon through a TCP connection must count
+/// the work of the daemon, or the learned claim of a Gradle build becomes the
+/// smallest claim.
+///
+/// The job connects to a port of this test, and a busy shell in a group of its
+/// own holds the socket that accepted the connection, as a Gradle daemon does.
+/// The job is shorter than the usual time between two measurements, as a small
+/// build is.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_work_of_a_connected_daemon_counts_as_the_use_of_the_job() {
+    use std::os::unix::process::CommandExt;
+
+    struct KillOnDrop(std::process::Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let h = Harness::with_default_config("daemon-use");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let id = h.submit(&[
+        "submit",
+        "--",
+        "bash",
+        "-c",
+        &format!("exec 3<>/dev/tcp/127.0.0.1/{port}; sleep 4"),
+    ]);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let stream = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(Instant::now() < deadline, "the job did not connect");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => panic!("accept failed: {e}"),
+        }
+    };
+    stream.set_nonblocking(false).unwrap();
+    let _daemon = KillOnDrop(
+        Command::new("bash")
+            .arg("-c")
+            .arg("while :; do :; done")
+            .stdin(std::process::Stdio::from(std::os::fd::OwnedFd::from(
+                stream,
+            )))
+            .process_group(0)
+            .spawn()
+            .unwrap(),
+    );
+    h.ok(&["wait", &id]);
+
+    let status = h.status_json(&id);
+    assert_eq!(status["state"], "completed", "got: {status}");
+    let cpu_secs = status["usage"]["cpu_secs"].as_f64().unwrap();
+    assert!(
+        cpu_secs > 1.5,
+        "the daemon kept a core busy while the job ran for 4s, so the job must count \
+         more than 1.5s; got {cpu_secs:.3}s: {status}"
+    );
+}
+
 /// A job that starts again must never show the state of the attempt that
 /// failed.
 ///

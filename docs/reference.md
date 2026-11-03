@@ -506,6 +506,33 @@ Each of these results is data for you. A job that waits for ever gives no data.
 The status field `forced` is `true` for such a job, and `qex submit` writes a
 warning at the time of the submission.
 
+### A job that uses little of its claim
+
+A claim is an estimate of the peak of a job, and a test suite that waits for a
+child process holds the whole of it for hours. `[system] claim_relax_after` and
+`claim_relax_below` let a job hold only the cores that it uses, once it has used
+less than `claim_relax_below` percent of its claim for `claim_relax_after`:
+
+```toml
+[system]
+claim_relax_after = "10m"   # 0 = never, which is the default
+claim_relax_below = 25      # percent of the claimed cores
+```
+
+qex measures the CPU time of the process group of each job that operates every
+5 seconds. A job whose use stays below the limit for the whole time counts, in
+the test of the budget before a job starts, as the cores that it used, rounded
+up and never less than one. One measurement at or above the limit, a CPU time
+that falls, or a measurement that qex missed starts that time again.
+
+The rule changes the test before a job starts and nothing else. The job keeps
+the claim that it recorded, `qex info` reports it, the claim that the other
+users read is the full one, and qex gives the devices and the memory that it
+asked for. Memory is never reclaimed: a job can return to its peak of memory at
+any moment. A job that used no CPU for a while can also wake up, so the budget
+is no longer a hard cap while the rule is on — qex may start one job more than
+the full claims would allow, and the two jobs that share a core are both slower.
+
 ## A submission that a script can repeat
 
 A script that runs a second time must not start a second copy of the work. Give
@@ -1467,6 +1494,9 @@ mem = "75%"           # memory that qex can use; 90% under single-user
 [system]
 reserve_mem  = "2GB"  # memory to keep free; 512MB under single-user
 max_pressure = 20     # maximum PSI memory pressure (Linux only)
+claim_relax_after = "0"  # a job below claim_relax_below for this long holds
+                         # only the cores that it uses; 0 = never
+claim_relax_below = 25   # percent of the claimed cores
 
 [enforce]
 mode = "cooperative"  # cooperative, or single-user
@@ -1615,7 +1645,8 @@ disagree about the budget of qex. Measured: the new values arrive in 0.52s to
 
 The new values apply to the jobs that START after the change. A job that
 operates keeps the claim that it made, and the coordinator keeps that claim
-against the budget until the job stops.
+against the budget until the job stops, unless `[system] claim_relax_after`
+takes part of it back (see below).
 
 **qex compares the CONTENT of the file, and not its time.** Linux takes the time
 of a file from a coarse clock with the granularity of one tick, which is 4

@@ -775,6 +775,9 @@ that qex uses now.
     [system]
     reserve_mem  = \"2GB\"  # memory to keep free for other programs (see mode)
     max_pressure = 20     # maximum PSI memory pressure (Linux only)
+    claim_relax_after = \"0\"  # a job below claim_relax_below for this long holds
+                             # only the cores that it uses; 0 = never
+    claim_relax_below = 25   # percent of the claimed cores
 
     [enforce]
     mode = \"cooperative\" # cooperative, or single-user
