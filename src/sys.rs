@@ -664,6 +664,27 @@ mod tests {
             assert!(!own_pid_alive(1));
         }
     }
+
+    /// The first line is from `/proc/net/tcp`. The second is the other end of
+    /// the same connection, through an IPv6 socket, as `/proc/net/tcp6` gives
+    /// it. The third is a socket that listens.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_two_ends_of_a_connection_compare_equal_across_the_two_tables() {
+        let tcp = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+                   13: 0100007F:B546 0100007F:830B 01 00000000:00000000 00:00000000 00000000  1001        0 220857 1 0000000000000000 20\n\
+                   14: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1001        0 220001 1 0000000000000000 20\n";
+        let tcp6 = "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+                    20: 0000000000000000FFFF00000100007F:830B 0000000000000000FFFF00000100007F:B546 01 00000000:00000000 00:00000000 00000000  1001        0 220851 1 0000000000000000 20\n";
+        let v4 = parse_tcp_table(tcp);
+        let v6 = parse_tcp_table(tcp6);
+        assert_eq!(v4.len(), 1, "a socket that listens is not a connection");
+        assert_eq!(v4[0].local, "127.0.0.1:46406".parse().unwrap());
+        assert_eq!(v4[0].remote, "127.0.0.1:33547".parse().unwrap());
+        assert_eq!(v4[0].inode, 220857);
+        assert_eq!(v6[0].local, v4[0].remote);
+        assert_eq!(v6[0].remote, v4[0].local);
+    }
 }
 
 /// The resources that one process group uses now.
@@ -764,6 +785,165 @@ pub fn group_usage(pgid: i32) -> GroupUsage {
         out.processes += 1;
     }
     out
+}
+
+/// One process of the machine, as `/proc` gives it.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ProcessUse {
+    pub pid: i32,
+    pub ppid: i32,
+    pub pgid: i32,
+    pub uid: u32,
+    pub start: Option<u64>,
+    /// The CPU time of the process and of each child that it reaped, in
+    /// seconds. A child that stops moves its time into this value of its
+    /// parent, so the sum over a tree of processes does not fall.
+    pub cpu_secs: f64,
+    pub rss: u64,
+}
+
+/// Reads each process of the machine.
+#[cfg(target_os = "linux")]
+pub fn processes() -> Vec<ProcessUse> {
+    use std::os::unix::fs::MetadataExt;
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as f64;
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        let Ok(meta) = entry.metadata() else { continue };
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        if let Some(process) = parse_process_stat(pid, meta.uid(), &stat, page, ticks) {
+            out.push(process);
+        }
+    }
+    out
+}
+
+#[cfg(target_os = "linux")]
+fn parse_process_stat(pid: i32, uid: u32, stat: &str, page: u64, ticks: f64) -> Option<ProcessUse> {
+    let (_, rest) = stat.rsplit_once(") ")?;
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    if fields.len() < 22 {
+        return None;
+    }
+    let number = |i: usize| fields[i].parse::<f64>().unwrap_or(0.0);
+    Some(ProcessUse {
+        pid,
+        ppid: fields[1].parse().ok()?,
+        pgid: fields[2].parse().ok()?,
+        uid,
+        start: fields[19].parse().ok(),
+        cpu_secs: (number(11) + number(12) + number(13) + number(14)) / ticks,
+        rss: fields[21].parse::<u64>().unwrap_or(0) * page,
+    })
+}
+
+/// One open TCP connection of this machine.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TcpLink {
+    pub local: std::net::SocketAddr,
+    pub remote: std::net::SocketAddr,
+    pub inode: u64,
+}
+
+/// Reads the open TCP connections of the network of this process.
+#[cfg(target_os = "linux")]
+pub fn tcp_links() -> Vec<TcpLink> {
+    ["/proc/self/net/tcp", "/proc/self/net/tcp6"]
+        .iter()
+        .filter_map(|path| std::fs::read_to_string(path).ok())
+        .flat_map(|text| parse_tcp_table(&text))
+        .collect()
+}
+
+/// Reads one table of `/proc/net/tcp` or `/proc/net/tcp6`, and keeps the
+/// connections in the state ESTABLISHED.
+///
+/// A connection of IPv4 through an IPv6 socket has an address of the form
+/// `::ffff:a.b.c.d`, and the other end can be an IPv4 socket. Each such address
+/// becomes an IPv4 address, so the two ends compare equal.
+#[cfg(target_os = "linux")]
+pub fn parse_tcp_table(text: &str) -> Vec<TcpLink> {
+    const ESTABLISHED: &str = "01";
+    text.lines()
+        .skip(1)
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() < 10 || fields[3] != ESTABLISHED {
+                return None;
+            }
+            Some(TcpLink {
+                local: parse_tcp_address(fields[1])?,
+                remote: parse_tcp_address(fields[2])?,
+                inode: fields[9].parse().ok()?,
+            })
+        })
+        .collect()
+}
+
+/// The kernel writes each 32-bit word of the address as a number in the byte
+/// order of the machine, and the port as a number.
+#[cfg(target_os = "linux")]
+fn parse_tcp_address(text: &str) -> Option<std::net::SocketAddr> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    let (address, port) = text.split_once(':')?;
+    let port = u16::from_str_radix(port, 16).ok()?;
+    let word = |i: usize| -> Option<[u8; 4]> {
+        let hex = address.get(i * 8..i * 8 + 8)?;
+        Some(u32::from_str_radix(hex, 16).ok()?.to_ne_bytes())
+    };
+    let ip = match address.len() {
+        8 => IpAddr::V4(Ipv4Addr::from(word(0)?)),
+        32 => {
+            let mut bytes = [0u8; 16];
+            for i in 0..4 {
+                bytes[i * 4..i * 4 + 4].copy_from_slice(&word(i)?);
+            }
+            let v6 = Ipv6Addr::from(bytes);
+            match v6.to_ipv4_mapped() {
+                Some(v4) => IpAddr::V4(v4),
+                None => IpAddr::V6(v6),
+            }
+        }
+        _ => return None,
+    };
+    Some(SocketAddr::new(ip, port))
+}
+
+/// Gives the inode of each socket that a process holds open. The system
+/// refuses this list for a process of another user, and the answer is then
+/// empty.
+#[cfg(target_os = "linux")]
+pub fn socket_inodes(pid: i32) -> Vec<u64> {
+    let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+        .filter_map(|target| {
+            target
+                .to_str()?
+                .strip_prefix("socket:[")?
+                .strip_suffix(']')?
+                .parse()
+                .ok()
+        })
+        .collect()
 }
 
 /// Reads a time from `ps`, in the form `MM:SS.ss` or `HH:MM:SS`.

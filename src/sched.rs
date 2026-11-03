@@ -1110,10 +1110,11 @@ pub fn run(coord: Arc<Coordinator>) {
 
 fn measure_use(coord: &Arc<Coordinator>) {
     let now = Instant::now();
-    let (jobs, below) = {
+    let (jobs, below, mut meters) = {
         let mut state = coord.state.lock().unwrap();
         if !matches!(state.cfg.claim_relax_after(), Ok(Some(_))) {
             state.relax.clear();
+            state.daemons.clear();
             return;
         }
         if !state.relax.due(now) {
@@ -1125,30 +1126,33 @@ fn measure_use(coord: &Arc<Coordinator>) {
             .filter(|(_, job)| job.status.state.is_active())
             .filter_map(|(id, job)| job.status.pid.map(|pid| (*id, job.status.cpu, pid)))
             .collect();
-        (jobs, state.cfg.claim_relax_below())
+        let meters = std::mem::take(&mut state.daemons);
+        (jobs, state.cfg.claim_relax_below(), meters)
     };
 
+    // A job that gives its work to a daemon must not read as idle, so the use
+    // counts the processes at the other end of each TCP connection as well.
+    let mut kept = std::collections::BTreeMap::new();
     let observed: Vec<crate::relax::Observed> = jobs
         .into_iter()
         .filter_map(|(id, claim, pid)| {
-            let usage = sys::group_usage(pid);
+            let mut meter = meters.remove(&id).unwrap_or_default();
+            let usage = meter.measure(pid);
+            kept.insert(id, meter);
             // A group that qex cannot read says nothing about the use, and a
             // job without a measurement must keep its whole claim.
-            (usage.processes > 0).then(|| crate::relax::Observed {
+            (usage.processes > 0).then_some(crate::relax::Observed {
                 id,
                 claim,
                 pid,
-                cpu_secs: usage.cpu_secs + usage.reaped_cpu_secs,
+                cpu_secs: usage.cpu_secs,
             })
         })
         .collect();
 
-    coord
-        .state
-        .lock()
-        .unwrap()
-        .relax
-        .observe(now, below, &observed);
+    let mut state = coord.state.lock().unwrap();
+    state.relax.observe(now, below, &observed);
+    state.daemons = kept;
 }
 
 /// Starts each job that can start now.
@@ -2566,6 +2570,7 @@ mod tests {
             head: None,
             peer_claims: Default::default(),
             relax: Default::default(),
+            daemons: Default::default(),
             stop: false,
         }
     }

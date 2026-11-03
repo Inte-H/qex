@@ -6992,6 +6992,53 @@ fn the_status_gives_the_measured_use_of_a_job() {
     );
 }
 
+/// A job that gives its work to a daemon through a TCP connection must count
+/// the work of the daemon, or the learned claim of a Gradle build becomes the
+/// smallest claim.
+///
+/// Here the test process is the daemon: it accepts the connection of the job
+/// and keeps one core busy while the job sleeps.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_work_of_a_connected_daemon_counts_as_the_use_of_the_job() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let h = Harness::with_default_config("daemon-use");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let done = std::sync::Arc::new(AtomicBool::new(false));
+    let daemon = {
+        let done = std::sync::Arc::clone(&done);
+        std::thread::spawn(move || {
+            let (_connection, _) = listener.accept().unwrap();
+            let mut spins = 0u64;
+            while !done.load(Ordering::Relaxed) {
+                spins = std::hint::black_box(spins.wrapping_add(1));
+            }
+        })
+    };
+
+    let id = h.submit(&[
+        "submit",
+        "--",
+        "bash",
+        "-c",
+        &format!("exec 3<>/dev/tcp/127.0.0.1/{port}; sleep 12"),
+    ]);
+    h.ok(&["wait", &id]);
+    done.store(true, Ordering::Relaxed);
+    daemon.join().unwrap();
+
+    let status = h.status_json(&id);
+    assert_eq!(status["state"], "completed", "got: {status}");
+    let cpu_secs = status["usage"]["cpu_secs"].as_f64().unwrap();
+    assert!(
+        cpu_secs > 3.0,
+        "the daemon kept a core busy for 12s and qex measures every 5s, so the job must \
+         count more than 3s; got {cpu_secs:.3}s: {status}"
+    );
+}
+
 /// A job that starts again must never show the state of the attempt that
 /// failed.
 ///
