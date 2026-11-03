@@ -1926,8 +1926,7 @@ fn reclaimed_cores(held: u64, cpu: u64, budget: u64, relaxed: u64) -> u64 {
 }
 
 /// The cores of a job of `cpu` cores that do not fit in `budget` beside the
-/// `held` cores. The test before a job starts and the count of the reclaimed
-/// cores both use it, so the two agree.
+/// `held` cores.
 fn cores_over(held: u64, cpu: u64, budget: u64) -> u64 {
     (held + cpu).saturating_sub(budget)
 }
