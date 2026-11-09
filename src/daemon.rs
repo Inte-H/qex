@@ -263,6 +263,11 @@ pub struct State {
     pub relax: crate::relax::Relax,
     /// The work that each job gives to a daemon. See `crate::daemons`.
     pub daemons: std::collections::BTreeMap<uuid::Uuid, crate::daemons::DaemonUse>,
+    /// The last measured memory of each job that operates.
+    pub mem_used: std::collections::BTreeMap<uuid::Uuid, u64>,
+    /// The last scheduler pass that read a memory pressure above
+    /// `max_pressure`.
+    pub pressure_high_at: Option<Instant>,
     pub stop: bool,
 }
 
@@ -599,6 +604,8 @@ impl State {
             peer_claims: crate::peers::Claims::default(),
             relax: Default::default(),
             daemons: Default::default(),
+            mem_used: Default::default(),
+            pressure_high_at: None,
             stop: false,
         }
     }
@@ -696,7 +703,19 @@ impl State {
         let mut held = self.claimed();
         let relaxed = self.reclaimed_cpu();
         held.cpu = held.cpu.saturating_sub(relaxed);
+        held.mem_over = self.mem_above_claims();
+        held.mem += held.mem_over;
         (held, relaxed)
+    }
+
+    /// Gives the memory that the jobs which operate now used above their
+    /// claims. A job counts the larger of its claim and its measured memory.
+    fn mem_above_claims(&self) -> u64 {
+        self.jobs
+            .iter()
+            .filter(|(_, job)| job.status.state.is_active())
+            .filter_map(|(id, job)| Some(self.mem_used.get(id)?.saturating_sub(job.status.mem)))
+            .sum()
     }
 
     pub fn reclaimed_cpu(&self) -> u64 {
@@ -1010,6 +1029,11 @@ pub struct Coordinator {
 
 impl Coordinator {
     pub(crate) fn new(cfg: Config, config_seen: u64) -> Self {
+        let pressure_high_at = crate::sched::pressure_high_at_start(
+            crate::sys::memory_pressure_minute(),
+            cfg.system.max_pressure,
+            Instant::now(),
+        );
         Self {
             state: Mutex::new(State {
                 cfg,
@@ -1037,6 +1061,8 @@ impl Coordinator {
                 peer_claims: crate::peers::Claims::default(),
                 relax: crate::relax::Relax::default(),
                 daemons: Default::default(),
+                mem_used: Default::default(),
+                pressure_high_at,
                 stop: false,
             }),
             changed: Condvar::new(),
@@ -3348,6 +3374,8 @@ mod tests {
             peer_claims: Default::default(),
             relax: Default::default(),
             daemons: Default::default(),
+            mem_used: Default::default(),
+            pressure_high_at: None,
             stop: false,
             config_seen: 0,
             config_settling: None,

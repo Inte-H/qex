@@ -54,11 +54,6 @@ impl Relax {
             .unwrap_or(true)
     }
 
-    pub fn clear(&mut self) {
-        self.tracks.clear();
-        self.sampled_at = None;
-    }
-
     /// A job that is not in `jobs` stopped, so its track goes away. `below` is
     /// the limit as a percentage of the claim.
     pub fn observe(&mut self, now: Instant, below: f64, jobs: &[Observed]) {

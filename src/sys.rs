@@ -55,14 +55,31 @@ pub fn available_memory() -> u64 {
 /// and the caller uses the free memory test only.
 #[cfg(target_os = "linux")]
 pub fn memory_pressure() -> Option<f64> {
+    pressure_field("avg10=")
+}
+
+/// Gives the memory pressure of the last 60 seconds, in the same form as
+/// [`memory_pressure`].
+#[cfg(target_os = "linux")]
+pub fn memory_pressure_minute() -> Option<f64> {
+    pressure_field("avg60=")
+}
+
+#[cfg(target_os = "linux")]
+fn pressure_field(name: &str) -> Option<f64> {
     let text = std::fs::read_to_string("/proc/pressure/memory").ok()?;
     let some = text.lines().find(|l| l.starts_with("some "))?;
-    let field = some.split_whitespace().find(|f| f.starts_with("avg10="))?;
-    field.trim_start_matches("avg10=").parse().ok()
+    let field = some.split_whitespace().find(|f| f.starts_with(name))?;
+    field.trim_start_matches(name).parse().ok()
 }
 
 #[cfg(not(target_os = "linux"))]
 pub fn memory_pressure() -> Option<f64> {
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn memory_pressure_minute() -> Option<f64> {
     None
 }
 

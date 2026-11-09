@@ -289,6 +289,8 @@ enum Admit {
 pub struct Held {
     pub cpu: u64,
     pub mem: u64,
+    /// The part of `mem` that the jobs used above their claims.
+    pub mem_over: u64,
     /// The units of each pool. The key is the pool name.
     pub pools: BTreeMap<String, u64>,
     /// The quantity in use on each device. The keys are the pool name and the
@@ -356,6 +358,9 @@ impl Held {
 struct Machine {
     available: u64,
     pressure: Option<f64>,
+    /// The time since the last pass that read a pressure above the limit.
+    /// `None` when this coordinator never read one.
+    high_pressure_ago: Option<Duration>,
     peers: crate::peers::Claims,
 }
 
@@ -364,6 +369,7 @@ impl Machine {
         Self {
             available: sys::available_memory(),
             pressure: sys::memory_pressure(),
+            high_pressure_ago: None,
             // This function gives an empty total when the config turns the
             // peers off, so there is no test here.
             peers: crate::peers::claims(cfg),
@@ -728,10 +734,11 @@ fn admit(
     if mem_used + mem > mem_budget {
         return sibling_wait(
             format!(
-                "waits for memory: this job needs {}, and the jobs of this queue hold {} of the {} \
-                 budget.",
+                "waits for memory: this job needs {}, and the jobs of this queue hold {}{} of the \
+                 {} budget.",
                 format_size(mem),
                 format_size(mem_used),
+                above_claims(held.mem_over),
                 format_size(mem_budget)
             ),
             "memory",
@@ -768,11 +775,12 @@ fn admit(
                 blocker: Blocker::Peer { count: peers.count },
                 reason: format!(
                     "this job cannot fit while another user holds capacity: the job needs {}, this \
-                     queue holds {} of the {} budget, and {} {}. qex does not control that user, \
+                     queue holds {}{} of the {} budget, and {} {}. qex does not control that user, \
                      so this wait has no known end. qex starts the jobs behind this one while the \
                      capacity is not free. Read `qex info` for the load of the machine.",
                     format_size(mem),
                     format_size(mem_used),
+                    above_claims(held.mem_over),
                     format_size(mem_budget),
                     other_users(peers.count),
                     format_size(peers.mem)
@@ -859,9 +867,48 @@ fn admit(
                 held_reason: None,
             };
         }
+        if let Some(ago) = machine.high_pressure_ago.filter(|ago| *ago < PRESSURE_CALM) {
+            return Admit::No {
+                blocker: Blocker::Machine,
+                reason: format!(
+                    "waits for the machine: the memory pressure is {:.1} and the limit is {:.1}, \
+                     but the pressure was above the limit {}s ago. qex starts a job when the \
+                     pressure stays below the limit for {}s. qex starts the jobs behind this one \
+                     while the pressure is not stable.",
+                    pressure,
+                    cfg.system.max_pressure,
+                    ago.as_secs(),
+                    PRESSURE_CALM.as_secs()
+                ),
+                held_reason: None,
+            };
+        }
     }
 
     Admit::Yes
+}
+
+/// How long the memory pressure must stay below `max_pressure` before a job
+/// starts.
+const PRESSURE_CALM: Duration = Duration::from_secs(30);
+
+/// Gives `pressure_high_at` for a coordinator that starts and has read no
+/// pressure yet. `minute` is the pressure of the last 60 seconds.
+pub fn pressure_high_at_start(minute: Option<f64>, limit: f64, now: Instant) -> Option<Instant> {
+    minute.filter(|p| *p > limit).map(|_| now)
+}
+
+/// Gives the words that say how much of the memory of the queue is above the
+/// claims of its jobs, or nothing when no job is above its claim.
+fn above_claims(over: u64) -> String {
+    if over == 0 {
+        String::new()
+    } else {
+        format!(
+            " ({} above their claims, which qex measured)",
+            format_size(over)
+        )
+    }
 }
 
 /// The decision for one job that has no dependency and no lock left.
@@ -936,7 +983,10 @@ fn verdict(
                 let pressure_ok = machine
                     .pressure
                     .map(|p| p <= cfg.system.max_pressure)
-                    .unwrap_or(true);
+                    .unwrap_or(true)
+                    && machine
+                        .high_pressure_ago
+                        .is_none_or(|ago| ago >= PRESSURE_CALM);
                 if quiet && peers_idle && pressure_ok {
                     return Verdict::Start;
                 }
@@ -1108,15 +1158,22 @@ pub fn run(coord: Arc<Coordinator>) {
     }
 }
 
+/// Gives the memory of each job in `measured`. A job that is not in
+/// `measured` stopped, and a measurement that failed keeps the earlier one.
+fn next_use(
+    old: &BTreeMap<uuid::Uuid, u64>,
+    measured: &[(uuid::Uuid, Option<u64>)],
+) -> BTreeMap<uuid::Uuid, u64> {
+    measured
+        .iter()
+        .filter_map(|(id, rss)| Some((*id, rss.or_else(|| old.get(id).copied())?)))
+        .collect()
+}
+
 fn measure_use(coord: &Arc<Coordinator>) {
     let now = Instant::now();
     let (jobs, below, mut meters) = {
         let mut state = coord.state.lock().unwrap();
-        if !matches!(state.cfg.claim_relax_after(), Ok(Some(_))) {
-            state.relax.clear();
-            state.daemons.clear();
-            return;
-        }
         if !state.relax.due(now) {
             return;
         }
@@ -1133,6 +1190,7 @@ fn measure_use(coord: &Arc<Coordinator>) {
     // A job that gives its work to a daemon must not read as idle, so the use
     // counts the processes at the other end of each TCP connection as well.
     let mut kept = std::collections::BTreeMap::new();
+    let mut rss = Vec::new();
     let observed: Vec<crate::relax::Observed> = jobs
         .into_iter()
         .filter_map(|(id, claim, pid)| {
@@ -1141,7 +1199,9 @@ fn measure_use(coord: &Arc<Coordinator>) {
             kept.insert(id, meter);
             // A group that qex cannot read says nothing about the use, and a
             // job without a measurement must keep its whole claim.
-            (usage.processes > 0).then_some(crate::relax::Observed {
+            let measured = usage.processes > 0;
+            rss.push((id, measured.then_some(usage.rss)));
+            measured.then_some(crate::relax::Observed {
                 id,
                 claim,
                 pid,
@@ -1153,6 +1213,7 @@ fn measure_use(coord: &Arc<Coordinator>) {
     let mut state = coord.state.lock().unwrap();
     state.relax.observe(now, below, &observed);
     state.daemons = kept;
+    state.mem_used = next_use(&state.mem_used, &rss);
 }
 
 /// Starts each job that can start now.
@@ -1614,7 +1675,15 @@ fn choose(state: &mut crate::daemon::State) -> Choice {
     let quiet = active == 0 && idle_since.map(|t| t.elapsed() >= settle).unwrap_or(false);
 
     // Measure the machine one time for this pass. See [`Machine`].
-    let machine = Machine::read(&cfg);
+    let mut machine = Machine::read(&cfg);
+    let now = Instant::now();
+    if machine
+        .pressure
+        .is_some_and(|p| p > cfg.system.max_pressure)
+    {
+        state.pressure_high_at = Some(now);
+    }
+    machine.high_pressure_ago = state.pressure_high_at.map(|t| now.duration_since(t));
 
     // Collect the decisions first. The loop cannot change the state while it
     // reads the jobs.
@@ -2591,6 +2660,8 @@ mod tests {
             peer_claims: Default::default(),
             relax: Default::default(),
             daemons: Default::default(),
+            mem_used: Default::default(),
+            pressure_high_at: None,
             stop: false,
         }
     }
@@ -2704,6 +2775,142 @@ mod tests {
             choice.reclaimed, 2,
             "the third job fits only on the idle cores"
         );
+    }
+
+    fn add_running_job_with_mem(
+        state: &mut crate::daemon::State,
+        mem: u64,
+        pid: i32,
+    ) -> uuid::Uuid {
+        let id = add_running_job(state, 1, pid);
+        let job = state.jobs.get_mut(&id).unwrap();
+        job.spec.mem = mem;
+        job.status.mem = mem;
+        id
+    }
+
+    fn state_for_memory(
+        running_claim: u64,
+        running_use: Option<u64>,
+    ) -> (crate::daemon::State, uuid::Uuid) {
+        let mut state = state_with(JobState::Running, None, 0);
+        state.queue.clear();
+        state.jobs.clear();
+        state.cfg = cfg_with("4", "64MB");
+        let running = add_running_job_with_mem(&mut state, running_claim, 10);
+        if let Some(used) = running_use {
+            state.mem_used.insert(running, used);
+        }
+        let next = add_job(&mut state, JobState::Queued, 1, None, 0);
+        let job = state.jobs.get_mut(&next).unwrap();
+        job.spec.mem = 32 << 20;
+        job.status.mem = 32 << 20;
+        (state, next)
+    }
+
+    #[test]
+    fn a_job_above_its_claim_counts_its_measured_use_in_the_budget() {
+        let (mut over, _) = state_for_memory(8 << 20, Some(48 << 20));
+        assert_eq!(
+            over.claimed().mem,
+            8 << 20,
+            "the claims themselves do not change"
+        );
+        assert_eq!(over.admission().0.mem, 48 << 20);
+        let choice = choose(&mut over);
+        assert_eq!(
+            choice.start, None,
+            "48MB used plus 32MB claimed is above 64MB"
+        );
+        let waiting = over.queue[0];
+        let text = over.jobs[&waiting].status.blocked_reason.clone().unwrap();
+        assert!(text.contains("40MB above their claims"), "got: {text}");
+    }
+
+    #[test]
+    fn a_job_inside_its_claim_counts_its_claim_in_the_budget() {
+        let (mut inside, next) = state_for_memory(8 << 20, Some(4 << 20));
+        assert_eq!(inside.admission().0.mem, 8 << 20);
+        assert_eq!(choose(&mut inside).start, Some(next));
+
+        let (mut unmeasured, next) = state_for_memory(8 << 20, None);
+        assert_eq!(choose(&mut unmeasured).start, Some(next));
+    }
+
+    #[test]
+    fn the_use_of_a_job_is_its_last_measurement() {
+        let a = uuid::Uuid::new_v4();
+        let b = uuid::Uuid::new_v4();
+        let gone = uuid::Uuid::new_v4();
+        let old = BTreeMap::from([(a, 10), (b, 10), (gone, 10)]);
+        let next = next_use(&old, &[(a, Some(4)), (b, Some(20))]);
+        assert_eq!(
+            next,
+            BTreeMap::from([(a, 4), (b, 20)]),
+            "a stopped job leaves"
+        );
+
+        let kept = next_use(&old, &[(a, None)]);
+        assert_eq!(
+            kept[&a], 10,
+            "a measurement that failed keeps the earlier one"
+        );
+        let fresh = next_use(&BTreeMap::new(), &[(a, None)]);
+        assert!(fresh.is_empty(), "a job with no measurement has no use");
+    }
+
+    #[test]
+    fn a_job_waits_until_the_pressure_stayed_low_for_the_whole_period() {
+        let mut cfg = cfg_with("4", "64MB");
+        cfg.system.max_pressure = 50.0;
+        let machine = |ago: Option<u64>| Machine {
+            available: u64::MAX / 2,
+            pressure: Some(5.0),
+            high_pressure_ago: ago.map(Duration::from_secs),
+            peers: Default::default(),
+        };
+
+        let Admit::No {
+            blocker, reason, ..
+        } = admit_plain(&cfg, 1, 1 << 20, 0, 0, &machine(Some(10)))
+        else {
+            panic!("one low sample after a high pressure is not a free machine");
+        };
+        assert_eq!(blocker, Blocker::Machine);
+        assert!(reason.contains("10s ago"), "got: {reason}");
+        assert!(reason.contains("for 30s"), "got: {reason}");
+
+        assert!(matches!(
+            admit_plain(&cfg, 1, 1 << 20, 0, 0, &machine(Some(30))),
+            Admit::Yes
+        ));
+        assert!(matches!(
+            admit_plain(&cfg, 1, 1 << 20, 0, 0, &machine(None)),
+            Admit::Yes
+        ));
+        assert!(matches!(
+            verdict_plain(&cfg, 64, 64 << 20, 0, 0, &machine(Some(10)), true),
+            Verdict::Wait { .. }
+        ));
+    }
+
+    #[test]
+    fn a_coordinator_that_starts_reads_the_pressure_of_the_last_minute() {
+        let now = Instant::now();
+        assert_eq!(pressure_high_at_start(Some(12.0), 10.0, now), Some(now));
+        assert_eq!(pressure_high_at_start(Some(10.0), 10.0, now), None);
+        assert_eq!(pressure_high_at_start(None, 10.0, now), None);
+    }
+
+    #[test]
+    fn the_scheduler_remembers_a_high_pressure_between_passes() {
+        let (mut recent, _) = state_for_memory(8 << 20, None);
+        recent.pressure_high_at = Instant::now().checked_sub(Duration::from_secs(10));
+        assert_eq!(choose(&mut recent).start, None);
+
+        let (mut earlier, next) = state_for_memory(8 << 20, None);
+        earlier.pressure_high_at = Instant::now().checked_sub(Duration::from_secs(31));
+        assert_eq!(choose(&mut earlier).start, Some(next));
     }
 
     /// The claims of the other users count in the budget, so a job can need the
@@ -3580,6 +3787,7 @@ mod tests {
         let mut peer_machine = Machine {
             available: u64::MAX / 2,
             pressure: None,
+            high_pressure_ago: None,
             peers: crate::peers::Claims {
                 cpu: 1,
                 count: 1,
@@ -3856,6 +4064,7 @@ mod tests {
         let machine = Machine {
             available: u64::MAX / 2,
             pressure: None,
+            high_pressure_ago: None,
             peers,
         };
 
@@ -3901,6 +4110,7 @@ mod tests {
         let machine = Machine {
             available: u64::MAX / 2,
             pressure: None,
+            high_pressure_ago: None,
             peers,
         };
 
@@ -4281,6 +4491,7 @@ mod tests {
         let machine_free = Machine {
             available: u64::MAX / 2,
             pressure: None,
+            high_pressure_ago: None,
             peers: crate::peers::Claims::default(),
         };
         assert!(matches!(
@@ -4308,6 +4519,7 @@ mod tests {
         let machine_busy = Machine {
             available: u64::MAX / 2,
             pressure: None,
+            high_pressure_ago: None,
             peers,
         };
         let Admit::No { blocker, .. } = admit(
