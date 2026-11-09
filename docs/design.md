@@ -154,6 +154,12 @@ claim after the job starts.
 20GB can still fill the machine. qex tests the free memory of the machine before
 each start, which limits the damage, but an accurate claim is better.
 
+**A job above its claim counts with its measured memory.** qex measures each job
+that operates every 5 seconds, with the processes that the job is connected to.
+Before a start, each job counts the larger of its claim and its last
+measurement. A job that gives memory back gives it back to the budget too, so a
+job that climbs again after that can still fill the machine.
+
 ## The property that an agent needs most
 
 The job is not a child of your shell, and it is not a child of your agent. The
@@ -272,6 +278,10 @@ does not count the memory in swap, and that a smaller claim or a lower
 The pressure, and not the free memory, is the measurement that separates a
 machine that is full from a machine that parked memory nobody wants. qex reads
 it (`/proc/pressure/memory`, Linux only) as a second test with `max_pressure`.
+The pressure must stay below `max_pressure` for 30 seconds before a job starts.
+`avg10` is an average of 10 seconds, so one low sample between high samples is
+not a machine with free memory. A coordinator that starts has no samples of its
+own, so it reads `avg60`: above `max_pressure`, the first job waits 30 seconds.
 **qex does not yet use the pressure to RELEASE a job that the free-memory test
 holds.** That is the correct change for this case, and it needs a machine in
 that state to test it, so it waits.

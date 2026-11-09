@@ -1345,11 +1345,13 @@ When does a job start
 qex starts a job when all these conditions are true:
 
   1. The claims of the jobs that operate, plus this claim, are in the budget.
+     A job that uses more memory than its claim counts with its measured memory.
   2. The claims of the other users leave sufficient capacity.
   3. Each pool that the job claims has free units, or free devices with
      sufficient capacity.
-  4. The free memory stays above `reserve_mem` and the memory pressure is below
-     `max_pressure`.
+  4. The free memory stays above `reserve_mem`, and the memory pressure was
+     below `max_pressure` for the last 30 seconds. A coordinator that just
+     started reads the average of the last minute for the time before it.
 
 If a job waits, `qex status` gives the reason in the `blocked_reason` field.
 

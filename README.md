@@ -241,7 +241,8 @@ read and the submission, and both agents start a job in that gap.
 ## The budget, and what a claim is
 
 A claim is a number of cores and a quantity of memory. qex starts a job when the
-claims of the jobs that operate, plus this claim, stay inside the budget.
+claims of the jobs that operate, plus this claim, stay inside the budget. A job
+that uses more memory than its claim counts with the memory that qex measured.
 
 **The budget is 75% of the cores and 75% of the memory of the machine.** The
 missing quarter is room for work that qex does not control. Set another value in
@@ -339,8 +340,8 @@ measurement as the claim for the next job of the same command.
 
 **qex applies no limit**, so nothing stops a job that goes above its
 claim. A job that claims 2GB and uses 20GB can still fill the machine. qex tests
-the free memory before each start, which limits the damage, but an accurate
-claim is better.
+the free memory before each start and counts the measured memory of a job above
+its claim, which limits the damage, but an accurate claim is better.
 
 **qex does not limit the CPU of a job.** The `cpu` controller of cgroup v2 is
 not available to a user on a usual Linux system, and macOS has no equivalent.

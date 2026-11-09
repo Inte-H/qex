@@ -836,6 +836,8 @@ mod tests {
             peer_claims: Default::default(),
             relax: Default::default(),
             daemons: Default::default(),
+            mem_used: Default::default(),
+            pressure_high_at: None,
             stop: false,
         }
     }
