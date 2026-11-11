@@ -530,8 +530,8 @@ the claim that it recorded, `qex info` reports it, the claim that the other
 users read is the full one, and qex gives the devices and the memory that it
 asked for. Memory is never reclaimed: a job can return to its peak of memory at
 any moment. The one exception is a job with a command inside it that waits for
-another job (`qex run`, `qex wait`, `--wait`): it counts with its measured
-memory and cores until the other job stops or the wait ends. A job that used
+another job (`qex run`, `qex wait`, `--wait`): the test of that other job, and
+of no other, counts it with its measured memory and cores. A job that used
 no CPU for a while can also wake up, so the budget is no longer a hard cap while
 the rule is on — qex may start one job more than the full claims would allow,
 and the two jobs that share a core are both slower.

@@ -292,7 +292,7 @@ pub struct Held {
     /// The part of `mem` that the jobs used above their claims.
     pub mem_over: u64,
     /// The part of the claims that `mem` does not count, because a command
-    /// inside the jobs waits for another job. See `State::lending`.
+    /// inside a job waits for the job under test. See `State::lent`.
     pub mem_lent: u64,
     /// The units of each pool. The key is the pool name.
     pub pools: BTreeMap<String, u64>,
@@ -913,8 +913,8 @@ fn counted_note(held: &Held) -> String {
     }
     if held.mem_lent > 0 {
         parts.push(format!(
-            "{} of their claims not counted, because a command inside those jobs waits for \
-             another job, and the jobs do not use it",
+            "{} of their claims not counted, because a command inside one of them waits for \
+             this job, and that job does not use it",
             format_size(held.mem_lent)
         ));
     }
@@ -1673,6 +1673,7 @@ struct Head {
 /// before every job behind it as soon as it can start.
 fn choose(state: &mut crate::daemon::State) -> Choice {
     let (held, relaxed) = state.admission();
+    let lent = state.lent();
     let cfg = state.cfg.clone();
     // A config file that qex cannot read gives no pool. Every claim then falls
     // back to a pool of one unit, which is a lock, and no job gets a device it
@@ -1811,8 +1812,22 @@ fn choose(state: &mut crate::daemon::State) -> Choice {
         let name = job.status.display_name();
         let passed_by = job.status.passed_by;
 
+        let with_lent;
+        let (held, relaxed) = match lent.get(&id) {
+            Some(&(mem, cpu)) => {
+                with_lent = Held {
+                    cpu: held.cpu.saturating_sub(cpu),
+                    mem: held.mem.saturating_sub(mem),
+                    mem_lent: mem,
+                    ..held.clone()
+                };
+                (&with_lent, relaxed + cpu)
+            }
+            None => (&held, relaxed),
+        };
+
         match verdict(
-            &cfg, &pools, &job.spec, claim_cpu, claim_mem, &held, &machine, quiet,
+            &cfg, &pools, &job.spec, claim_cpu, claim_mem, held, &machine, quiet,
         ) {
             Verdict::Start => {
                 chosen = Some(id);
@@ -2904,12 +2919,42 @@ mod tests {
     fn a_job_that_waits_for_a_qex_run_inside_it_counts_at_its_measured_use() {
         let (mut state, _, inner) = state_for_nested(14 << 30, 7 << 20, 6 << 30);
         state.add_waiter(inner, outer_chain());
-        assert_eq!(state.admission().0.mem, 7 << 20);
+        assert_eq!(state.lent()[&inner].0, (14 << 30) - (7 << 20));
         assert_eq!(
             choose(&mut state).start,
             Some(inner),
             "7MB used plus 6GB claimed fits in 17.6GB"
         );
+    }
+
+    #[test]
+    fn a_different_job_in_the_queue_does_not_start_in_the_lent_share() {
+        let mut state = state_with(JobState::Running, None, 0);
+        state.queue.clear();
+        state.jobs.clear();
+        state.cfg = cfg_with("8", "17600MB");
+        let outer = add_running_job_with_mem(&mut state, 14 << 30, 10);
+        let job = state.jobs.get_mut(&outer).unwrap();
+        job.status.supervisor_pid = Some(9);
+        job.status.supervisor_start_token = Some(90);
+        state.mem_used.insert(outer, 7 << 20);
+        let other = add_job(&mut state, JobState::Queued, 1, None, 0);
+        let job = state.jobs.get_mut(&other).unwrap();
+        job.spec.mem = 4 << 30;
+        job.status.mem = 4 << 30;
+        let inner = add_job(&mut state, JobState::Queued, 1, None, 0);
+        let job = state.jobs.get_mut(&inner).unwrap();
+        job.spec.mem = 6 << 30;
+        job.status.mem = 6 << 30;
+        state.add_waiter(inner, outer_chain());
+
+        assert_eq!(
+            choose(&mut state).start,
+            Some(inner),
+            "the job in front waits, and the job that the outer job waits for passes it"
+        );
+        let text = state.jobs[&other].status.blocked_reason.clone().unwrap();
+        assert!(text.contains("waits for memory"), "got: {text}");
     }
 
     #[test]
@@ -2932,10 +2977,10 @@ mod tests {
         let job = state.jobs.get_mut(&inner).unwrap();
         job.status.state = JobState::Running;
         job.status.pid = Some(20);
-        assert_eq!(state.admission().0.mem, (7 << 20) + (6 << 30));
+        assert!(state.lent().contains_key(&inner));
 
         state.jobs.get_mut(&inner).unwrap().status.state = JobState::Completed;
-        assert_eq!(state.admission().0.mem, 14 << 30);
+        assert!(state.lent().is_empty());
     }
 
     #[test]
@@ -2950,16 +2995,16 @@ mod tests {
     fn a_wait_from_outside_every_job_lends_nothing() {
         let (mut state, _, inner) = state_for_nested(14 << 30, 7 << 20, 6 << 30);
         state.add_waiter(inner, vec![process(50, Some(500)), process(1, None)]);
-        assert_eq!(state.admission().0.mem, 14 << 30);
+        assert!(state.lent().is_empty());
     }
 
     #[test]
     fn the_lending_ends_with_the_wait() {
         let (mut state, _, inner) = state_for_nested(14 << 30, 7 << 20, 6 << 30);
         let key = state.add_waiter(inner, outer_chain());
-        assert_eq!(state.admission().0.mem, 7 << 20);
+        assert!(state.lent().contains_key(&inner));
         state.waiters.remove(&key);
-        assert_eq!(state.admission().0.mem, 14 << 30);
+        assert!(state.lent().is_empty());
     }
 
     #[test]
@@ -2973,13 +3018,13 @@ mod tests {
 
     #[test]
     fn only_the_nearest_job_in_the_chain_lends() {
-        let (mut state, _, inner) = state_for_nested(4 << 30, 7 << 20, 6 << 30);
+        let (mut state, _, inner) = state_for_nested(4 << 30, 1 << 30, 6 << 30);
         let further = add_running_job_with_mem(&mut state, 4 << 30, 30);
         state.mem_used.insert(further, 7 << 20);
         let mut chain = outer_chain();
         chain.push(process(30, None));
         state.add_waiter(inner, chain);
-        assert_eq!(state.admission().0.mem, (7 << 20) + (4 << 30));
+        assert_eq!(state.lent()[&inner].0, 3 << 30);
     }
 
     #[test]

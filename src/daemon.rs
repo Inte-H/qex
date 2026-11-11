@@ -706,14 +706,39 @@ impl State {
     /// The claims that the test before a job starts uses, and the cores that
     /// the claims of idle jobs leave.
     pub fn admission(&self) -> (crate::sched::Held, u64) {
-        let lending = self.lending();
         let mut held = self.claimed();
-        let relaxed = self.reclaimed_cpu(&lending);
+        let relaxed = self.reclaimed_cpu();
         held.cpu = held.cpu.saturating_sub(relaxed);
         held.mem_over = self.mem_above_claims();
-        held.mem_lent = self.mem_lent(&lending);
-        held.mem = (held.mem + held.mem_over).saturating_sub(held.mem_lent);
+        held.mem += held.mem_over;
         (held, relaxed)
+    }
+
+    /// Gives, for each job that a command inside an outer job waits for, the
+    /// memory and the cores of the claim of the outer job that its last
+    /// measurements did not use. Only that job may start in them; every other
+    /// job counts the outer job as `admission` does.
+    pub fn lent(&self) -> std::collections::BTreeMap<uuid::Uuid, (u64, u64)> {
+        let after = self.cfg.claim_relax_after().ok().flatten();
+        let now = Instant::now();
+        self.lending()
+            .into_iter()
+            .filter_map(|(inner, outer)| {
+                let job = self.jobs.get(&outer)?;
+                let (claim, pid) = (job.status.cpu, job.status.pid);
+                let mem = self
+                    .mem_used
+                    .get(&outer)
+                    .map_or(0, |used| job.status.mem.saturating_sub(*used));
+                let counted = after.map_or(claim, |after| {
+                    self.relax.counted(&outer, claim, pid, after, now)
+                });
+                let cpu = self.relax.last_use(&outer, pid).map_or(0, |used| {
+                    counted.saturating_sub(crate::relax::counted_cores(claim, used))
+                });
+                Some((inner, (mem, cpu)))
+            })
+            .collect()
     }
 
     /// Records a command that waits for the job `id`, with the chain of
@@ -725,10 +750,10 @@ impl State {
         key
     }
 
-    /// Gives each job that operates and holds a command that waits for a
-    /// different job, while that job has not stopped. Only the nearest job in
-    /// the chain of the command is in the answer.
-    fn lending(&self) -> std::collections::BTreeSet<uuid::Uuid> {
+    /// Gives each job that a command waits for and that has not stopped, with
+    /// the job that operates and holds that command. Only the nearest job in
+    /// the chain of the command is the holder.
+    fn lending(&self) -> std::collections::BTreeMap<uuid::Uuid, uuid::Uuid> {
         let processes: Vec<(uuid::Uuid, i32, Option<u64>)> = self
             .jobs
             .iter()
@@ -754,27 +779,10 @@ impl State {
                     processes
                         .iter()
                         .find(|(id, pid, start)| id != inner && is_process(ancestor, *pid, *start))
-                        .map(|(id, _, _)| *id)
+                        .map(|(id, _, _)| (*inner, *id))
                 })
             })
             .collect()
-    }
-
-    /// Gives the part of the claims of the jobs in `lending` that their last
-    /// measurements did not use. A job with no measurement lends nothing.
-    fn mem_lent(&self, lending: &std::collections::BTreeSet<uuid::Uuid>) -> u64 {
-        lending
-            .iter()
-            .filter_map(|id| {
-                Some(
-                    self.jobs
-                        .get(id)?
-                        .status
-                        .mem
-                        .saturating_sub(*self.mem_used.get(id)?),
-                )
-            })
-            .sum()
     }
 
     /// Gives the memory that the jobs which operate now used above their
@@ -787,27 +795,17 @@ impl State {
             .sum()
     }
 
-    /// Gives the cores that the claims of jobs which operate and use little
-    /// leave free: a job below `claim_relax_below` for `claim_relax_after`, and
-    /// a job in `lending`, which counts at its last measured use.
-    fn reclaimed_cpu(&self, lending: &std::collections::BTreeSet<uuid::Uuid>) -> u64 {
-        let after = self.cfg.claim_relax_after().ok().flatten();
+    pub fn reclaimed_cpu(&self) -> u64 {
+        let Ok(Some(after)) = self.cfg.claim_relax_after() else {
+            return 0;
+        };
         let now = Instant::now();
         self.jobs
             .iter()
             .filter(|(_, job)| job.status.state.is_active())
             .map(|(id, job)| {
                 let claim = job.status.cpu;
-                let pid = job.status.pid;
-                let relaxed = after.map_or(claim, |after| {
-                    self.relax.counted(id, claim, pid, after, now)
-                });
-                let lent = lending
-                    .contains(id)
-                    .then(|| self.relax.last_use(id, pid))
-                    .flatten()
-                    .map_or(claim, |used| crate::relax::counted_cores(claim, used));
-                claim - relaxed.min(lent)
+                claim - self.relax.counted(id, claim, job.status.pid, after, now)
             })
             .sum()
     }
