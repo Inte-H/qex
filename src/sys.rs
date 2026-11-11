@@ -295,6 +295,29 @@ pub fn same_process_start(pid: i32, recorded: Option<u64>) -> bool {
     }
 }
 
+/// Tests if the process `pid` that started at `start` still runs. A zombie
+/// has stopped, although the machine keeps its pid and its start time until
+/// its parent reads its exit.
+pub fn process_runs(pid: i32, start: u64) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        let Some((_, rest)) = stat.rsplit_once(')') else {
+            return false;
+        };
+        let mut fields = rest.split_whitespace();
+        let state = fields.next();
+        !matches!(state, Some("Z") | Some("X"))
+            && fields.nth(18).and_then(|f| f.parse().ok()) == Some(start)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        process_start_token(pid) == Some(start)
+    }
+}
+
 /// Gives a value that identifies ONE START of a process.
 ///
 /// The machine uses each pid again. Two processes that had one pid started at
@@ -588,6 +611,35 @@ pub fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_zombie_does_not_run() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let start = process_start_token(pid).unwrap();
+        assert!(process_runs(pid, start));
+        assert!(
+            !process_runs(pid, start + 1),
+            "a different start is a stranger"
+        );
+
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while process_runs(pid, start) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(
+            process_start_token(pid),
+            Some(start),
+            "the zombie keeps its record"
+        );
+        assert!(!process_runs(pid, start));
+        child.wait().unwrap();
+    }
 
     #[test]
     fn machine_capacity_is_plausible() {

@@ -2983,15 +2983,18 @@ fn handle_wait(
             }
             None => return no_such_job(id),
         }
-        if let Some((pid, start)) = waiter {
-            if start.is_some() && sys::process_start_token(pid) != start {
+        if let Some((pid, Some(start))) = waiter {
+            if !sys::process_runs(pid, start) {
                 return Response::Ok;
             }
         }
 
+        // The test of the waiter above runs only when this thread wakes, and a
+        // job above the waiter lends its share until then. See `lending`.
+        let nap = if waiter.is_some() { 1 } else { 30 };
         let (guard, _) = coord
             .changed
-            .wait_timeout(state, Duration::from_secs(30))
+            .wait_timeout(state, Duration::from_secs(nap))
             .unwrap();
         state = guard;
     }

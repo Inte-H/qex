@@ -291,8 +291,8 @@ pub struct Held {
     pub mem: u64,
     /// The part of `mem` that the jobs used above their claims.
     pub mem_over: u64,
-    /// The part of the claims that `mem` does not count, because the jobs wait
-    /// for a `qex run` inside them and use less. See `State::lending`.
+    /// The part of the claims that `mem` does not count, because a command
+    /// inside the jobs waits for another job. See `State::lending`.
     pub mem_lent: u64,
     /// The units of each pool. The key is the pool name.
     pub pools: BTreeMap<String, u64>,
@@ -913,8 +913,8 @@ fn counted_note(held: &Held) -> String {
     }
     if held.mem_lent > 0 {
         parts.push(format!(
-            "{} of their claims not counted, because those jobs wait for a `qex run` inside them \
-             and do not use it",
+            "{} of their claims not counted, because a command inside those jobs waits for \
+             another job, and the jobs do not use it",
             format_size(held.mem_lent)
         ));
     }
@@ -2163,7 +2163,8 @@ fn start_job(coord: &Arc<Coordinator>, id: uuid::Uuid, reclaimed: u64) -> anyhow
     if reclaimed > 0 {
         log(&format!(
             "job {id} ({name}) starts on {} that operating jobs claim and do not use \
-             ([system] claim_relax_after, or a job that waits for a `qex run` inside it)",
+             ([system] claim_relax_after, or a job with a command inside it that waits for \
+             another job)",
             cores(reclaimed)
         ));
     }
