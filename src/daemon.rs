@@ -265,6 +265,9 @@ pub struct State {
     pub daemons: std::collections::BTreeMap<uuid::Uuid, crate::daemons::DaemonUse>,
     /// The last measured memory of each job that operates.
     pub mem_used: std::collections::BTreeMap<uuid::Uuid, u64>,
+    /// The jobs that a `qex run` waits for now, with the number of its
+    /// connections that own each job. See `State::lending`.
+    pub waited: std::collections::BTreeMap<uuid::Uuid, usize>,
     /// The last scheduler pass that read a memory pressure above
     /// `max_pressure`.
     pub pressure_high_at: Option<Instant>,
@@ -605,6 +608,7 @@ impl State {
             relax: Default::default(),
             daemons: Default::default(),
             mem_used: Default::default(),
+            waited: Default::default(),
             pressure_high_at: None,
             stop: false,
         }
@@ -700,12 +704,65 @@ impl State {
     /// The claims that the test before a job starts uses, and the cores that
     /// the claims of idle jobs leave.
     pub fn admission(&self) -> (crate::sched::Held, u64) {
+        let lending = self.lending();
         let mut held = self.claimed();
-        let relaxed = self.reclaimed_cpu();
+        let relaxed = self.reclaimed_cpu(&lending);
         held.cpu = held.cpu.saturating_sub(relaxed);
         held.mem_over = self.mem_above_claims();
-        held.mem += held.mem_over;
+        held.mem_lent = self.mem_lent(&lending);
+        held.mem = (held.mem + held.mem_over).saturating_sub(held.mem_lent);
         (held, relaxed)
+    }
+
+    /// Gives each job that operates and waits for a `qex run` that a command
+    /// inside it submitted, while the inner job has not stopped. Only the
+    /// nearest job in the chain of the submission is in the answer.
+    fn lending(&self) -> std::collections::BTreeSet<uuid::Uuid> {
+        let processes: Vec<(uuid::Uuid, i32, Option<u64>)> = self
+            .jobs
+            .iter()
+            .filter(|(_, job)| job.status.state.is_active())
+            .flat_map(|(id, job)| {
+                [
+                    (job.status.supervisor_pid, job.status.supervisor_start_token),
+                    (job.status.pid, job.status.pid_start_token),
+                ]
+                .into_iter()
+                .filter_map(move |(pid, start)| pid.map(|pid| (*id, pid, start)))
+            })
+            .collect();
+        self.waited
+            .keys()
+            .filter_map(|id| self.jobs.get(id))
+            .filter(|inner| !inner.status.state.is_terminal())
+            .filter_map(|inner| {
+                inner.status.submitter.iter().find_map(|ancestor| {
+                    processes
+                        .iter()
+                        .find(|(id, pid, start)| {
+                            *id != inner.status.id && is_process(ancestor, *pid, *start)
+                        })
+                        .map(|(id, _, _)| *id)
+                })
+            })
+            .collect()
+    }
+
+    /// Gives the part of the claims of the jobs in `lending` that their last
+    /// measurements did not use. A job with no measurement lends nothing.
+    fn mem_lent(&self, lending: &std::collections::BTreeSet<uuid::Uuid>) -> u64 {
+        lending
+            .iter()
+            .filter_map(|id| {
+                Some(
+                    self.jobs
+                        .get(id)?
+                        .status
+                        .mem
+                        .saturating_sub(*self.mem_used.get(id)?),
+                )
+            })
+            .sum()
     }
 
     /// Gives the memory that the jobs which operate now used above their
@@ -718,17 +775,27 @@ impl State {
             .sum()
     }
 
-    pub fn reclaimed_cpu(&self) -> u64 {
-        let Ok(Some(after)) = self.cfg.claim_relax_after() else {
-            return 0;
-        };
+    /// Gives the cores that the claims of jobs which operate and use little
+    /// leave free: a job below `claim_relax_below` for `claim_relax_after`, and
+    /// a job in `lending`, which counts at its last measured use.
+    fn reclaimed_cpu(&self, lending: &std::collections::BTreeSet<uuid::Uuid>) -> u64 {
+        let after = self.cfg.claim_relax_after().ok().flatten();
         let now = Instant::now();
         self.jobs
             .iter()
             .filter(|(_, job)| job.status.state.is_active())
             .map(|(id, job)| {
                 let claim = job.status.cpu;
-                claim - self.relax.counted(id, claim, job.status.pid, after, now)
+                let pid = job.status.pid;
+                let relaxed = after.map_or(claim, |after| {
+                    self.relax.counted(id, claim, pid, after, now)
+                });
+                let lent = lending
+                    .contains(id)
+                    .then(|| self.relax.last_use(id, pid))
+                    .flatten()
+                    .map_or(claim, |used| crate::relax::counted_cores(claim, used));
+                claim - relaxed.min(lent)
             })
             .sum()
     }
@@ -1062,6 +1129,7 @@ impl Coordinator {
                 relax: crate::relax::Relax::default(),
                 daemons: Default::default(),
                 mem_used: Default::default(),
+                waited: Default::default(),
                 pressure_high_at,
                 stop: false,
             }),
@@ -1716,7 +1784,19 @@ struct OwnedJobs {
 
 impl Drop for OwnedJobs {
     fn drop(&mut self) {
-        for id in std::mem::take(&mut self.ids) {
+        let ids = std::mem::take(&mut self.ids);
+        {
+            let mut state = self.coord.state.lock().unwrap();
+            for id in &ids {
+                if let Some(count) = state.waited.get_mut(id) {
+                    *count -= 1;
+                    if *count == 0 {
+                        state.waited.remove(id);
+                    }
+                }
+            }
+        }
+        for id in ids {
             if cancel_queued(
                 &self.coord,
                 id,
@@ -1774,7 +1854,10 @@ fn serve(coord: Arc<Coordinator>, stream: UnixStream) -> Result<()> {
             // The ownership belongs to THIS connection, so this request cannot
             // go to `handle`, which knows nothing about the connection.
             Ok(Request::OwnJob { id }) => {
-                if coord.state.lock().unwrap().known(id).is_some() {
+                let mut state = coord.state.lock().unwrap();
+                if state.known(id).is_some() {
+                    *state.waited.entry(id).or_insert(0) += 1;
+                    drop(state);
                     owned.ids.push(id);
                     Response::Ok
                 } else {
@@ -2007,11 +2090,14 @@ fn runs_inside_a_job(
     jobs: &[(i32, Option<u64>)],
 ) -> bool {
     chain.iter().any(|p| {
-        p.pid == coordinator
-            || jobs
-                .iter()
-                .any(|(pid, start)| *pid == p.pid && (start.is_none() || *start == p.start))
+        p.pid == coordinator || jobs.iter().any(|(pid, start)| is_process(p, *pid, *start))
     })
+}
+
+/// Tests if one process of a chain is the process with this pid and start
+/// time. See `runs_inside_a_job` for the rule.
+fn is_process(ancestor: &crate::job::Ancestor, pid: i32, start: Option<u64>) -> bool {
+    ancestor.pid == pid && (start.is_none() || start == ancestor.start)
 }
 
 /// Makes one pause request, with the issuer that the coordinator read.
@@ -3375,6 +3461,7 @@ mod tests {
             relax: Default::default(),
             daemons: Default::default(),
             mem_used: Default::default(),
+            waited: Default::default(),
             pressure_high_at: None,
             stop: false,
             config_seen: 0,

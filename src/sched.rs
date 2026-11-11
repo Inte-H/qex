@@ -291,6 +291,9 @@ pub struct Held {
     pub mem: u64,
     /// The part of `mem` that the jobs used above their claims.
     pub mem_over: u64,
+    /// The part of the claims that `mem` does not count, because the jobs wait
+    /// for a `qex run` inside them and use less. See `State::lending`.
+    pub mem_lent: u64,
     /// The units of each pool. The key is the pool name.
     pub pools: BTreeMap<String, u64>,
     /// The quantity in use on each device. The keys are the pool name and the
@@ -738,7 +741,7 @@ fn admit(
                  {} budget.",
                 format_size(mem),
                 format_size(mem_used),
-                above_claims(held.mem_over),
+                counted_note(held),
                 format_size(mem_budget)
             ),
             "memory",
@@ -780,7 +783,7 @@ fn admit(
                      capacity is not free. Read `qex info` for the load of the machine.",
                     format_size(mem),
                     format_size(mem_used),
-                    above_claims(held.mem_over),
+                    counted_note(held),
                     format_size(mem_budget),
                     other_users(peers.count),
                     format_size(peers.mem)
@@ -898,16 +901,27 @@ pub fn pressure_high_at_start(minute: Option<f64>, limit: f64, now: Instant) -> 
     minute.filter(|p| *p > limit).map(|_| now)
 }
 
-/// Gives the words that say how much of the memory of the queue is above the
-/// claims of its jobs, or nothing when no job is above its claim.
-fn above_claims(over: u64) -> String {
-    if over == 0 {
+/// Gives the words that say how the memory of the queue differs from the
+/// claims of its jobs, or nothing when it does not.
+fn counted_note(held: &Held) -> String {
+    let mut parts = Vec::new();
+    if held.mem_over > 0 {
+        parts.push(format!(
+            "{} above their claims, which qex measured",
+            format_size(held.mem_over)
+        ));
+    }
+    if held.mem_lent > 0 {
+        parts.push(format!(
+            "{} of their claims not counted, because those jobs wait for a `qex run` inside them \
+             and do not use it",
+            format_size(held.mem_lent)
+        ));
+    }
+    if parts.is_empty() {
         String::new()
     } else {
-        format!(
-            " ({} above their claims, which qex measured)",
-            format_size(over)
-        )
+        format!(" ({})", parts.join("; "))
     }
 }
 
@@ -2149,7 +2163,7 @@ fn start_job(coord: &Arc<Coordinator>, id: uuid::Uuid, reclaimed: u64) -> anyhow
     if reclaimed > 0 {
         log(&format!(
             "job {id} ({name}) starts on {} that operating jobs claim and do not use \
-             ([system] claim_relax_after)",
+             ([system] claim_relax_after, or a job that waits for a `qex run` inside it)",
             cores(reclaimed)
         ));
     }
@@ -2661,6 +2675,7 @@ mod tests {
             relax: Default::default(),
             daemons: Default::default(),
             mem_used: Default::default(),
+            waited: Default::default(),
             pressure_high_at: None,
             stop: false,
         }
@@ -2835,6 +2850,135 @@ mod tests {
 
         let (mut unmeasured, next) = state_for_memory(8 << 20, None);
         assert_eq!(choose(&mut unmeasured).start, Some(next));
+    }
+
+    fn process(pid: i32, start: Option<u64>) -> crate::job::Ancestor {
+        crate::job::Ancestor {
+            pid,
+            ppid: 0,
+            start,
+            name: String::from("bash"),
+            cwd: None,
+            terminal: false,
+        }
+    }
+
+    /// An outer job that operates with the pid 10 under the supervisor 9, and
+    /// an inner job in the queue that a command of the outer job submitted.
+    fn state_for_nested(
+        outer_claim: u64,
+        outer_use: u64,
+        inner_claim: u64,
+    ) -> (crate::daemon::State, uuid::Uuid, uuid::Uuid) {
+        let mut state = state_with(JobState::Running, None, 0);
+        state.queue.clear();
+        state.jobs.clear();
+        state.cfg = cfg_with("8", "17600MB");
+        let outer = add_running_job_with_mem(&mut state, outer_claim, 10);
+        let job = state.jobs.get_mut(&outer).unwrap();
+        job.status.supervisor_pid = Some(9);
+        job.status.supervisor_start_token = Some(90);
+        state.mem_used.insert(outer, outer_use);
+
+        let inner = add_job(&mut state, JobState::Queued, 1, None, 0);
+        let job = state.jobs.get_mut(&inner).unwrap();
+        job.spec.mem = inner_claim;
+        job.status.mem = inner_claim;
+        job.status.submitter = vec![process(10, None), process(9, Some(90)), process(1, None)];
+        (state, outer, inner)
+    }
+
+    #[test]
+    fn a_job_that_waits_for_a_qex_run_inside_it_counts_at_its_measured_use() {
+        let (mut state, _, inner) = state_for_nested(14 << 30, 7 << 20, 6 << 30);
+        state.waited.insert(inner, 1);
+        assert_eq!(state.admission().0.mem, 7 << 20);
+        assert_eq!(
+            choose(&mut state).start,
+            Some(inner),
+            "7MB used plus 6GB claimed fits in 17.6GB"
+        );
+    }
+
+    #[test]
+    fn a_job_that_submits_a_job_inside_it_without_waiting_keeps_its_claim() {
+        let (mut state, _, inner) = state_for_nested(14 << 30, 7 << 20, 6 << 30);
+        assert_eq!(state.admission().0.mem, 14 << 30);
+        assert_eq!(
+            choose(&mut state).start,
+            None,
+            "14GB claimed plus 6GB claimed is above 17.6GB"
+        );
+        let text = state.jobs[&inner].status.blocked_reason.clone().unwrap();
+        assert!(text.contains("waits for memory"), "got: {text}");
+    }
+
+    #[test]
+    fn the_outer_job_lends_while_the_inner_job_operates_and_not_after_it() {
+        let (mut state, _, inner) = state_for_nested(14 << 30, 7 << 20, 6 << 30);
+        state.waited.insert(inner, 1);
+        let job = state.jobs.get_mut(&inner).unwrap();
+        job.status.state = JobState::Running;
+        job.status.pid = Some(20);
+        assert_eq!(state.admission().0.mem, (7 << 20) + (6 << 30));
+
+        state.jobs.get_mut(&inner).unwrap().status.state = JobState::Completed;
+        assert_eq!(state.admission().0.mem, 14 << 30);
+    }
+
+    #[test]
+    fn a_job_that_waits_and_still_does_not_fit_names_the_lent_memory() {
+        let (mut state, _, inner) = state_for_nested(14 << 30, 12 << 30, 6 << 30);
+        state.waited.insert(inner, 1);
+        assert_eq!(choose(&mut state).start, None);
+        let text = state.jobs[&inner].status.blocked_reason.clone().unwrap();
+        assert!(text.contains("of their claims not counted"), "got: {text}");
+    }
+
+    #[test]
+    fn only_the_nearest_job_in_the_chain_lends() {
+        let (mut state, _, inner) = state_for_nested(4 << 30, 7 << 20, 6 << 30);
+        state.waited.insert(inner, 1);
+        let further = add_running_job_with_mem(&mut state, 4 << 30, 30);
+        state.mem_used.insert(further, 7 << 20);
+        let job = state.jobs.get_mut(&inner).unwrap();
+        job.status.submitter.push(process(30, None));
+        assert_eq!(state.admission().0.mem, (7 << 20) + (4 << 30));
+    }
+
+    #[test]
+    fn a_job_that_waits_for_a_qex_run_inside_it_counts_at_its_measured_cores() {
+        let (mut state, outer, inner) = state_for_nested(1 << 20, 1 << 20, 1 << 20);
+        state.cfg = cfg_with("4", "64GB");
+        let job = state.jobs.get_mut(&outer).unwrap();
+        job.spec.cpu = 4;
+        job.status.cpu = 4;
+        let job = state.jobs.get_mut(&inner).unwrap();
+        job.spec.cpu = 3;
+        job.status.cpu = 3;
+        let at = Instant::now();
+        let sample = |cpu_secs| crate::relax::Observed {
+            id: outer,
+            claim: 4,
+            pid: 10,
+            cpu_secs,
+        };
+        state.relax.observe(at, 25.0, &[sample(0.0)]);
+        state
+            .relax
+            .observe(at + crate::relax::SAMPLE_EVERY, 25.0, &[sample(0.05)]);
+
+        assert_eq!(
+            choose(&mut state).start,
+            None,
+            "4 cores claimed plus 3 is above 4"
+        );
+        state.waited.insert(inner, 1);
+        assert_eq!(
+            choose(&mut state).start,
+            Some(inner),
+            "1 core measured plus 3 fits in 4"
+        );
     }
 
     #[test]

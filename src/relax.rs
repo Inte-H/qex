@@ -31,6 +31,8 @@ struct Track {
     low_since: Option<Instant>,
     /// The largest use, in cores, since `low_since`.
     peak: f64,
+    /// The use, in cores, between the last two measurements of this process.
+    used: Option<f64>,
 }
 
 #[derive(Debug, Default)]
@@ -66,36 +68,35 @@ impl Relax {
             };
             // A new attempt has a new process and a CPU time that starts at
             // 0, so its first measurement is a new start.
-            let fresh = Track {
-                last: sample,
-                low_since: None,
-                peak: 0.0,
-            };
-            let track = match self.tracks.get(&job.id) {
-                Some(old) if old.last.pid == job.pid => {
-                    // A measurement that the scheduler missed averages the use
-                    // over a longer time than it watched, and a total that
-                    // falls says that the measurement did not see every
-                    // process. Neither lifts a claim, so the time starts again.
-                    let gap = now.duration_since(old.last.at);
-                    match use_in_cores(&old.last, &sample) {
-                        Some(cores)
-                            if gap <= SAMPLE_EVERY * 2 && is_low(cores, job.claim, below) =>
-                        {
-                            Track {
-                                last: sample,
-                                low_since: Some(old.low_since.unwrap_or(old.last.at)),
-                                peak: if old.low_since.is_some() {
-                                    old.peak.max(cores)
-                                } else {
-                                    cores
-                                },
-                            }
-                        }
-                        _ => fresh,
-                    }
-                }
-                _ => fresh,
+            //
+            // A measurement that the scheduler missed averages the use over a
+            // longer time than it watched, and a total that falls says that
+            // the measurement did not see every process. Neither lifts a
+            // claim, so the time starts again.
+            let old = self
+                .tracks
+                .get(&job.id)
+                .filter(|old| old.last.pid == job.pid);
+            let used = old
+                .filter(|old| now.duration_since(old.last.at) <= SAMPLE_EVERY * 2)
+                .and_then(|old| use_in_cores(&old.last, &sample));
+            let track = match (old, used) {
+                (Some(old), Some(cores)) if is_low(cores, job.claim, below) => Track {
+                    last: sample,
+                    low_since: Some(old.low_since.unwrap_or(old.last.at)),
+                    peak: if old.low_since.is_some() {
+                        old.peak.max(cores)
+                    } else {
+                        cores
+                    },
+                    used,
+                },
+                _ => Track {
+                    last: sample,
+                    low_since: None,
+                    peak: 0.0,
+                    used,
+                },
             };
             next.insert(job.id, track);
         }
@@ -117,6 +118,7 @@ impl Relax {
                     last,
                     low_since: Some(since),
                     peak,
+                    ..
                 }),
                 Some(pid),
             ) if last.pid == pid && now.duration_since(*since) >= after => {
@@ -124,6 +126,15 @@ impl Relax {
             }
             _ => claim,
         }
+    }
+
+    /// Gives the cores that the process `pid` of the job used between the last
+    /// two measurements, or `None` when qex has no such measurement.
+    pub fn last_use(&self, id: &uuid::Uuid, pid: Option<i32>) -> Option<f64> {
+        self.tracks
+            .get(id)
+            .filter(|track| Some(track.last.pid) == pid)
+            .and_then(|track| track.used)
     }
 }
 
