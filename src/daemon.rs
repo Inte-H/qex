@@ -265,9 +265,10 @@ pub struct State {
     pub daemons: std::collections::BTreeMap<uuid::Uuid, crate::daemons::DaemonUse>,
     /// The last measured memory of each job that operates.
     pub mem_used: std::collections::BTreeMap<uuid::Uuid, u64>,
-    /// The jobs that a `qex run` waits for now, with the number of its
-    /// connections that own each job. See `State::lending`.
-    pub waited: std::collections::BTreeMap<uuid::Uuid, usize>,
+    /// The commands that wait for a job now: the job, and the chain of
+    /// processes from the command upward. See `State::lending`.
+    pub waiters: std::collections::BTreeMap<u64, (uuid::Uuid, Vec<crate::job::Ancestor>)>,
+    pub next_waiter: u64,
     /// The last scheduler pass that read a memory pressure above
     /// `max_pressure`.
     pub pressure_high_at: Option<Instant>,
@@ -608,7 +609,8 @@ impl State {
             relax: Default::default(),
             daemons: Default::default(),
             mem_used: Default::default(),
-            waited: Default::default(),
+            waiters: Default::default(),
+            next_waiter: 0,
             pressure_high_at: None,
             stop: false,
         }
@@ -714,9 +716,18 @@ impl State {
         (held, relaxed)
     }
 
-    /// Gives each job that operates and waits for a `qex run` that a command
-    /// inside it submitted, while the inner job has not stopped. Only the
-    /// nearest job in the chain of the submission is in the answer.
+    /// Records a command that waits for the job `id`, with the chain of
+    /// processes from the command upward. Gives the key for `waiters`.
+    pub fn add_waiter(&mut self, id: uuid::Uuid, chain: Vec<crate::job::Ancestor>) -> u64 {
+        let key = self.next_waiter;
+        self.next_waiter += 1;
+        self.waiters.insert(key, (id, chain));
+        key
+    }
+
+    /// Gives each job that operates and holds a command that waits for a
+    /// different job, while that job has not stopped. Only the nearest job in
+    /// the chain of the command is in the answer.
     fn lending(&self) -> std::collections::BTreeSet<uuid::Uuid> {
         let processes: Vec<(uuid::Uuid, i32, Option<u64>)> = self
             .jobs
@@ -731,17 +742,18 @@ impl State {
                 .filter_map(move |(pid, start)| pid.map(|pid| (*id, pid, start)))
             })
             .collect();
-        self.waited
-            .keys()
-            .filter_map(|id| self.jobs.get(id))
-            .filter(|inner| !inner.status.state.is_terminal())
-            .filter_map(|inner| {
-                inner.status.submitter.iter().find_map(|ancestor| {
+        self.waiters
+            .values()
+            .filter(|(inner, _)| {
+                self.jobs
+                    .get(inner)
+                    .is_some_and(|job| !job.status.state.is_terminal())
+            })
+            .filter_map(|(inner, chain)| {
+                chain.iter().find_map(|ancestor| {
                     processes
                         .iter()
-                        .find(|(id, pid, start)| {
-                            *id != inner.status.id && is_process(ancestor, *pid, *start)
-                        })
+                        .find(|(id, pid, start)| id != inner && is_process(ancestor, *pid, *start))
                         .map(|(id, _, _)| *id)
                 })
             })
@@ -1129,7 +1141,8 @@ impl Coordinator {
                 relax: crate::relax::Relax::default(),
                 daemons: Default::default(),
                 mem_used: Default::default(),
-                waited: Default::default(),
+                waiters: Default::default(),
+                next_waiter: 0,
                 pressure_high_at,
                 stop: false,
             }),
@@ -1780,23 +1793,19 @@ fn requeue_unstarted(status: &mut crate::job::JobStatus, supervisor_was_recorded
 struct OwnedJobs {
     coord: Arc<Coordinator>,
     ids: Vec<uuid::Uuid>,
+    /// The keys in `State::waiters` that this connection added.
+    waiters: Vec<u64>,
 }
 
 impl Drop for OwnedJobs {
     fn drop(&mut self) {
-        let ids = std::mem::take(&mut self.ids);
         {
             let mut state = self.coord.state.lock().unwrap();
-            for id in &ids {
-                if let Some(count) = state.waited.get_mut(id) {
-                    *count -= 1;
-                    if *count == 0 {
-                        state.waited.remove(id);
-                    }
-                }
+            for key in &self.waiters {
+                state.waiters.remove(key);
             }
         }
-        for id in ids {
+        for id in std::mem::take(&mut self.ids) {
             if cancel_queued(
                 &self.coord,
                 id,
@@ -1827,6 +1836,7 @@ fn serve(coord: Arc<Coordinator>, stream: UnixStream) -> Result<()> {
     let mut owned = OwnedJobs {
         coord: Arc::clone(&coord),
         ids: Vec::new(),
+        waiters: Vec::new(),
     };
 
     for line in reader.lines() {
@@ -1854,9 +1864,10 @@ fn serve(coord: Arc<Coordinator>, stream: UnixStream) -> Result<()> {
             // The ownership belongs to THIS connection, so this request cannot
             // go to `handle`, which knows nothing about the connection.
             Ok(Request::OwnJob { id }) => {
+                let chain = peer.map(sys::chain_from).unwrap_or_default();
                 let mut state = coord.state.lock().unwrap();
                 if state.known(id).is_some() {
-                    *state.waited.entry(id).or_insert(0) += 1;
+                    owned.waiters.push(state.add_waiter(id, chain));
                     drop(state);
                     owned.ids.push(id);
                     Response::Ok
@@ -1975,7 +1986,14 @@ fn handle(coord: &Arc<Coordinator>, request: Request, peer: Option<i32>) -> Resp
             ErrorKind::Internal,
             "qex could not open the event stream on this connection. Run `qex events` again.",
         ),
-        Request::Wait { id } => handle_wait(coord, id),
+        Request::Wait { id } => {
+            let chain = peer.map(sys::chain_from).unwrap_or_default();
+            let waiter = chain.first().map(|p| (p.pid, p.start));
+            let key = coord.state.lock().unwrap().add_waiter(id, chain);
+            let answer = handle_wait(coord, id, waiter);
+            coord.state.lock().unwrap().waiters.remove(&key);
+            answer
+        }
         Request::Cancel { id } => handle_cancel(coord, id),
         Request::Kill {
             id,
@@ -2938,7 +2956,13 @@ pub fn release_dedupe(state: &mut State, id: uuid::Uuid) {
     state.dedupe.retain(|_, holder| *holder != id);
 }
 
-fn handle_wait(coord: &Arc<Coordinator>, id: uuid::Uuid) -> Response {
+/// `waiter` is the pid and the start time of the command that waits. The wait
+/// ends when that process is gone.
+fn handle_wait(
+    coord: &Arc<Coordinator>,
+    id: uuid::Uuid,
+    waiter: Option<(i32, Option<u64>)>,
+) -> Response {
     let mut state = coord.state.lock().unwrap();
 
     // Sleep until the job reaches a final state. The condition variable wakes
@@ -2958,6 +2982,11 @@ fn handle_wait(coord: &Arc<Coordinator>, id: uuid::Uuid) -> Response {
                 return stopped_status(id);
             }
             None => return no_such_job(id),
+        }
+        if let Some((pid, start)) = waiter {
+            if start.is_some() && sys::process_start_token(pid) != start {
+                return Response::Ok;
+            }
         }
 
         let (guard, _) = coord
@@ -3461,7 +3490,8 @@ mod tests {
             relax: Default::default(),
             daemons: Default::default(),
             mem_used: Default::default(),
-            waited: Default::default(),
+            waiters: Default::default(),
+            next_waiter: 0,
             pressure_high_at: None,
             stop: false,
             config_seen: 0,

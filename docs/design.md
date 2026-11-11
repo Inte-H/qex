@@ -160,13 +160,14 @@ Before a start, each job counts the larger of its claim and its last
 measurement. A job that gives memory back gives it back to the budget too, so a
 job that climbs again after that can still fill the machine.
 
-**A job that waits for a `qex run` inside it counts at its measured use.** A
-command inside a job can run `qex run` and wait for the inner job. When the two
-claims are larger than the budget, the inner job would never start and the
-outer job would never end. While the inner job is in the queue or operates and
-the `qex run` waits for it, the nearest outer job counts with its last
-measurement of memory and cores, and not with its claim. A `qex submit` from
-inside a job does not wait in that way, so its outer job keeps its claim.
+**A job that waits for another job counts at its measured use.** A command
+inside a job can wait for an inner job: `qex run`, `qex submit --wait`,
+`qex wait` and `qex status --wait` all do. When the two claims are larger than
+the budget, the inner job would never start and the outer job would never end.
+While such a command waits and the inner job is in the queue or operates, the
+nearest job above the command counts with its last measurement of memory and
+cores, and not with its claim. A job that submits an inner job and does not
+wait for it keeps its claim.
 
 ## The property that an agent needs most
 

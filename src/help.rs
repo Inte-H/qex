@@ -1346,8 +1346,9 @@ qex starts a job when all these conditions are true:
 
   1. The claims of the jobs that operate, plus this claim, are in the budget.
      A job that uses more memory than its claim counts with its measured memory.
-     A job that waits for a `qex run` inside it counts with its measured memory
-     and cores, while that inner job waits or operates.
+     A job with a command inside it that waits for another job (`qex run`,
+     `qex wait`, `--wait`) counts with its measured memory and cores, while
+     that other job waits or operates.
   2. The claims of the other users leave sufficient capacity.
   3. Each pool that the job claims has free units, or free devices with
      sufficient capacity.

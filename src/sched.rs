@@ -2675,7 +2675,8 @@ mod tests {
             relax: Default::default(),
             daemons: Default::default(),
             mem_used: Default::default(),
-            waited: Default::default(),
+            waiters: Default::default(),
+            next_waiter: 0,
             pressure_high_at: None,
             stop: false,
         }
@@ -2884,14 +2885,24 @@ mod tests {
         let job = state.jobs.get_mut(&inner).unwrap();
         job.spec.mem = inner_claim;
         job.status.mem = inner_claim;
-        job.status.submitter = vec![process(10, None), process(9, Some(90)), process(1, None)];
+        job.status.submitter = outer_chain();
         (state, outer, inner)
+    }
+
+    /// The chain of a command inside the outer job of `state_for_nested`.
+    fn outer_chain() -> Vec<crate::job::Ancestor> {
+        vec![
+            process(11, Some(110)),
+            process(10, None),
+            process(9, Some(90)),
+            process(1, None),
+        ]
     }
 
     #[test]
     fn a_job_that_waits_for_a_qex_run_inside_it_counts_at_its_measured_use() {
         let (mut state, _, inner) = state_for_nested(14 << 30, 7 << 20, 6 << 30);
-        state.waited.insert(inner, 1);
+        state.add_waiter(inner, outer_chain());
         assert_eq!(state.admission().0.mem, 7 << 20);
         assert_eq!(
             choose(&mut state).start,
@@ -2916,7 +2927,7 @@ mod tests {
     #[test]
     fn the_outer_job_lends_while_the_inner_job_operates_and_not_after_it() {
         let (mut state, _, inner) = state_for_nested(14 << 30, 7 << 20, 6 << 30);
-        state.waited.insert(inner, 1);
+        state.add_waiter(inner, outer_chain());
         let job = state.jobs.get_mut(&inner).unwrap();
         job.status.state = JobState::Running;
         job.status.pid = Some(20);
@@ -2927,9 +2938,33 @@ mod tests {
     }
 
     #[test]
+    fn a_wait_from_inside_the_outer_job_lends_whatever_submitted_the_inner_job() {
+        let (mut state, _, inner) = state_for_nested(14 << 30, 7 << 20, 6 << 30);
+        state.jobs.get_mut(&inner).unwrap().status.submitter = vec![process(1, None)];
+        state.add_waiter(inner, outer_chain());
+        assert_eq!(choose(&mut state).start, Some(inner));
+    }
+
+    #[test]
+    fn a_wait_from_outside_every_job_lends_nothing() {
+        let (mut state, _, inner) = state_for_nested(14 << 30, 7 << 20, 6 << 30);
+        state.add_waiter(inner, vec![process(50, Some(500)), process(1, None)]);
+        assert_eq!(state.admission().0.mem, 14 << 30);
+    }
+
+    #[test]
+    fn the_lending_ends_with_the_wait() {
+        let (mut state, _, inner) = state_for_nested(14 << 30, 7 << 20, 6 << 30);
+        let key = state.add_waiter(inner, outer_chain());
+        assert_eq!(state.admission().0.mem, 7 << 20);
+        state.waiters.remove(&key);
+        assert_eq!(state.admission().0.mem, 14 << 30);
+    }
+
+    #[test]
     fn a_job_that_waits_and_still_does_not_fit_names_the_lent_memory() {
         let (mut state, _, inner) = state_for_nested(14 << 30, 12 << 30, 6 << 30);
-        state.waited.insert(inner, 1);
+        state.add_waiter(inner, outer_chain());
         assert_eq!(choose(&mut state).start, None);
         let text = state.jobs[&inner].status.blocked_reason.clone().unwrap();
         assert!(text.contains("of their claims not counted"), "got: {text}");
@@ -2938,11 +2973,11 @@ mod tests {
     #[test]
     fn only_the_nearest_job_in_the_chain_lends() {
         let (mut state, _, inner) = state_for_nested(4 << 30, 7 << 20, 6 << 30);
-        state.waited.insert(inner, 1);
         let further = add_running_job_with_mem(&mut state, 4 << 30, 30);
         state.mem_used.insert(further, 7 << 20);
-        let job = state.jobs.get_mut(&inner).unwrap();
-        job.status.submitter.push(process(30, None));
+        let mut chain = outer_chain();
+        chain.push(process(30, None));
+        state.add_waiter(inner, chain);
         assert_eq!(state.admission().0.mem, (7 << 20) + (4 << 30));
     }
 
@@ -2973,7 +3008,7 @@ mod tests {
             None,
             "4 cores claimed plus 3 is above 4"
         );
-        state.waited.insert(inner, 1);
+        state.add_waiter(inner, outer_chain());
         assert_eq!(
             choose(&mut state).start,
             Some(inner),

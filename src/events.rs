@@ -837,7 +837,8 @@ mod tests {
             relax: Default::default(),
             daemons: Default::default(),
             mem_used: Default::default(),
-            waited: Default::default(),
+            waiters: Default::default(),
+            next_waiter: 0,
             pressure_high_at: None,
             stop: false,
         }
