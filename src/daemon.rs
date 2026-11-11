@@ -265,6 +265,10 @@ pub struct State {
     pub daemons: std::collections::BTreeMap<uuid::Uuid, crate::daemons::DaemonUse>,
     /// The last measured memory of each job that operates.
     pub mem_used: std::collections::BTreeMap<uuid::Uuid, u64>,
+    /// The commands that wait for a job now: the job, and the chain of
+    /// processes from the command upward. See `State::lending`.
+    pub waiters: std::collections::BTreeMap<u64, (uuid::Uuid, Vec<crate::job::Ancestor>)>,
+    pub next_waiter: u64,
     /// The last scheduler pass that read a memory pressure above
     /// `max_pressure`.
     pub pressure_high_at: Option<Instant>,
@@ -605,6 +609,8 @@ impl State {
             relax: Default::default(),
             daemons: Default::default(),
             mem_used: Default::default(),
+            waiters: Default::default(),
+            next_waiter: 0,
             pressure_high_at: None,
             stop: false,
         }
@@ -706,6 +712,77 @@ impl State {
         held.mem_over = self.mem_above_claims();
         held.mem += held.mem_over;
         (held, relaxed)
+    }
+
+    /// Gives, for each job that a command inside an outer job waits for, the
+    /// memory and the cores of the claim of the outer job that its last
+    /// measurements did not use. Only that job may start in them; every other
+    /// job counts the outer job as `admission` does.
+    pub fn lent(&self) -> std::collections::BTreeMap<uuid::Uuid, (u64, u64)> {
+        let after = self.cfg.claim_relax_after().ok().flatten();
+        let now = Instant::now();
+        self.lending()
+            .into_iter()
+            .filter_map(|(inner, outer)| {
+                let job = self.jobs.get(&outer)?;
+                let (claim, pid) = (job.status.cpu, job.status.pid);
+                let mem = self
+                    .mem_used
+                    .get(&outer)
+                    .map_or(0, |used| job.status.mem.saturating_sub(*used));
+                let counted = after.map_or(claim, |after| {
+                    self.relax.counted(&outer, claim, pid, after, now)
+                });
+                let cpu = self.relax.last_use(&outer, pid).map_or(0, |used| {
+                    counted.saturating_sub(crate::relax::counted_cores(claim, used))
+                });
+                Some((inner, (mem, cpu)))
+            })
+            .collect()
+    }
+
+    /// Records a command that waits for the job `id`, with the chain of
+    /// processes from the command upward. Gives the key for `waiters`.
+    pub fn add_waiter(&mut self, id: uuid::Uuid, chain: Vec<crate::job::Ancestor>) -> u64 {
+        let key = self.next_waiter;
+        self.next_waiter += 1;
+        self.waiters.insert(key, (id, chain));
+        key
+    }
+
+    /// Gives each job that a command waits for and that has not stopped, with
+    /// the job that operates and holds that command. Only the nearest job in
+    /// the chain of the command is the holder.
+    fn lending(&self) -> std::collections::BTreeMap<uuid::Uuid, uuid::Uuid> {
+        let processes: Vec<(uuid::Uuid, i32, Option<u64>)> = self
+            .jobs
+            .iter()
+            .filter(|(_, job)| job.status.state.is_active())
+            .flat_map(|(id, job)| {
+                [
+                    (job.status.supervisor_pid, job.status.supervisor_start_token),
+                    (job.status.pid, job.status.pid_start_token),
+                ]
+                .into_iter()
+                .filter_map(move |(pid, start)| pid.map(|pid| (*id, pid, start)))
+            })
+            .collect();
+        self.waiters
+            .values()
+            .filter(|(inner, _)| {
+                self.jobs
+                    .get(inner)
+                    .is_some_and(|job| !job.status.state.is_terminal())
+            })
+            .filter_map(|(inner, chain)| {
+                chain.iter().find_map(|ancestor| {
+                    processes
+                        .iter()
+                        .find(|(id, pid, start)| id != inner && is_process(ancestor, *pid, *start))
+                        .map(|(id, _, _)| (*inner, *id))
+                })
+            })
+            .collect()
     }
 
     /// Gives the memory that the jobs which operate now used above their
@@ -1062,6 +1139,8 @@ impl Coordinator {
                 relax: crate::relax::Relax::default(),
                 daemons: Default::default(),
                 mem_used: Default::default(),
+                waiters: Default::default(),
+                next_waiter: 0,
                 pressure_high_at,
                 stop: false,
             }),
@@ -1712,10 +1791,18 @@ fn requeue_unstarted(status: &mut crate::job::JobStatus, supervisor_was_recorded
 struct OwnedJobs {
     coord: Arc<Coordinator>,
     ids: Vec<uuid::Uuid>,
+    /// The keys in `State::waiters` that this connection added.
+    waiters: Vec<u64>,
 }
 
 impl Drop for OwnedJobs {
     fn drop(&mut self) {
+        {
+            let mut state = self.coord.state.lock().unwrap();
+            for key in &self.waiters {
+                state.waiters.remove(key);
+            }
+        }
         for id in std::mem::take(&mut self.ids) {
             if cancel_queued(
                 &self.coord,
@@ -1747,6 +1834,7 @@ fn serve(coord: Arc<Coordinator>, stream: UnixStream) -> Result<()> {
     let mut owned = OwnedJobs {
         coord: Arc::clone(&coord),
         ids: Vec::new(),
+        waiters: Vec::new(),
     };
 
     for line in reader.lines() {
@@ -1774,7 +1862,11 @@ fn serve(coord: Arc<Coordinator>, stream: UnixStream) -> Result<()> {
             // The ownership belongs to THIS connection, so this request cannot
             // go to `handle`, which knows nothing about the connection.
             Ok(Request::OwnJob { id }) => {
-                if coord.state.lock().unwrap().known(id).is_some() {
+                let chain = peer.map(sys::chain_from).unwrap_or_default();
+                let mut state = coord.state.lock().unwrap();
+                if state.known(id).is_some() {
+                    owned.waiters.push(state.add_waiter(id, chain));
+                    drop(state);
                     owned.ids.push(id);
                     Response::Ok
                 } else {
@@ -1892,7 +1984,14 @@ fn handle(coord: &Arc<Coordinator>, request: Request, peer: Option<i32>) -> Resp
             ErrorKind::Internal,
             "qex could not open the event stream on this connection. Run `qex events` again.",
         ),
-        Request::Wait { id } => handle_wait(coord, id),
+        Request::Wait { id } => {
+            let chain = peer.map(sys::chain_from).unwrap_or_default();
+            let waiter = chain.first().map(|p| (p.pid, p.start));
+            let key = coord.state.lock().unwrap().add_waiter(id, chain);
+            let answer = handle_wait(coord, id, waiter);
+            coord.state.lock().unwrap().waiters.remove(&key);
+            answer
+        }
         Request::Cancel { id } => handle_cancel(coord, id),
         Request::Kill {
             id,
@@ -2007,11 +2106,14 @@ fn runs_inside_a_job(
     jobs: &[(i32, Option<u64>)],
 ) -> bool {
     chain.iter().any(|p| {
-        p.pid == coordinator
-            || jobs
-                .iter()
-                .any(|(pid, start)| *pid == p.pid && (start.is_none() || *start == p.start))
+        p.pid == coordinator || jobs.iter().any(|(pid, start)| is_process(p, *pid, *start))
     })
+}
+
+/// Tests if one process of a chain is the process with this pid and start
+/// time. See `runs_inside_a_job` for the rule.
+fn is_process(ancestor: &crate::job::Ancestor, pid: i32, start: Option<u64>) -> bool {
+    ancestor.pid == pid && (start.is_none() || start == ancestor.start)
 }
 
 /// Makes one pause request, with the issuer that the coordinator read.
@@ -2852,7 +2954,13 @@ pub fn release_dedupe(state: &mut State, id: uuid::Uuid) {
     state.dedupe.retain(|_, holder| *holder != id);
 }
 
-fn handle_wait(coord: &Arc<Coordinator>, id: uuid::Uuid) -> Response {
+/// `waiter` is the pid and the start time of the command that waits. The wait
+/// ends when that process is gone.
+fn handle_wait(
+    coord: &Arc<Coordinator>,
+    id: uuid::Uuid,
+    waiter: Option<(i32, Option<u64>)>,
+) -> Response {
     let mut state = coord.state.lock().unwrap();
 
     // Sleep until the job reaches a final state. The condition variable wakes
@@ -2873,10 +2981,18 @@ fn handle_wait(coord: &Arc<Coordinator>, id: uuid::Uuid) -> Response {
             }
             None => return no_such_job(id),
         }
+        if let Some((pid, Some(start))) = waiter {
+            if !sys::process_runs(pid, start) {
+                return Response::Ok;
+            }
+        }
 
+        // The test of the waiter above runs only when this thread wakes, and a
+        // job above the waiter lends its share until then. See `lending`.
+        let nap = if waiter.is_some() { 1 } else { 30 };
         let (guard, _) = coord
             .changed
-            .wait_timeout(state, Duration::from_secs(30))
+            .wait_timeout(state, Duration::from_secs(nap))
             .unwrap();
         state = guard;
     }
@@ -3375,6 +3491,8 @@ mod tests {
             relax: Default::default(),
             daemons: Default::default(),
             mem_used: Default::default(),
+            waiters: Default::default(),
+            next_waiter: 0,
             pressure_high_at: None,
             stop: false,
             config_seen: 0,
