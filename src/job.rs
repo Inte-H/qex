@@ -158,6 +158,15 @@ pub struct Usage {
     pub cpu_secs: f64,
 }
 
+/// The last measured use of a job that operates.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LiveUse {
+    /// Bytes of memory, with the work the job gave to a daemon.
+    pub mem: u64,
+    /// Cores in use between the last two measurements, when qex has them.
+    pub cpu: Option<f64>,
+}
+
 /// Gives the SAFE FORM of a job name: the ONLY form that qex shows.
 ///
 /// A safe name holds the letters `A` to `Z` and `a` to `z`, the numbers `0` to
@@ -540,6 +549,11 @@ pub struct JobStatus {
     #[serde(default)]
     pub group_name: Option<String>,
     pub usage: Usage,
+    /// What the job uses NOW, daemon share included. The coordinator sets it
+    /// on the copy it answers with, for a job that operates; no record on the
+    /// disk holds it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live: Option<LiveUse>,
     /// Shows that qex started the job although it is larger than the budget.
     ///
     /// qex starts such a job when no other job operates. A job that stays in
@@ -698,6 +712,7 @@ impl JobStatus {
             group: spec.group,
             group_name: spec.group_name.clone(),
             usage: Usage::default(),
+            live: None,
             forced: false,
             forced_reason: None,
             reclaimed_cpu: None,

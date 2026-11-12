@@ -7183,6 +7183,7 @@ mod tests {
             group: None,
             group_name: None,
             usage: Usage::default(),
+            live: None,
             forced: false,
             forced_reason: None,
             reclaimed_cpu: None,
