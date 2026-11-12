@@ -2424,13 +2424,13 @@ fn handle_query(coord: &Arc<Coordinator>, filter: &crate::proto::JobFilter) -> R
     let now = sys::now_secs();
 
     enum Hit {
-        Live(Arc<JobStatus>),
+        Live(Arc<JobStatus>, Option<crate::job::LiveUse>),
         Stopped(crate::proto::JobRow),
     }
     impl Hit {
         fn key(&self) -> (u64, u64, uuid::Uuid) {
             match self {
-                Hit::Live(j) => (j.submitted_at, j.sequence, j.id),
+                Hit::Live(j, _) => (j.submitted_at, j.sequence, j.id),
                 Hit::Stopped(r) => (r.submitted_at, r.sequence, r.id),
             }
         }
@@ -2463,7 +2463,10 @@ fn handle_query(coord: &Arc<Coordinator>, filter: &crate::proto::JobFilter) -> R
                 }
             };
             match (keep, known) {
-                (Keep::Yes, Known::Live(j)) => hits.push(Hit::Live(j.status.share())),
+                (Keep::Yes, Known::Live(j)) => {
+                    let live = state.live_use(&j.status.id, &j.status);
+                    hits.push(Hit::Live(j.status.share(), live));
+                }
                 (Keep::Yes, Known::Stopped(j)) => hits.push(Hit::Stopped(j.row.clone())),
                 (Keep::Older, _) => older += 1,
                 (Keep::No, _) => {}
@@ -2494,9 +2497,13 @@ fn handle_query(coord: &Arc<Coordinator>, filter: &crate::proto::JobFilter) -> R
     let mut jobs = Vec::new();
     for hit in hits {
         match (filter.full, hit) {
-            (false, Hit::Live(j)) => rows.push(crate::proto::JobRow::of(&j)),
+            (false, Hit::Live(j, _)) => rows.push(crate::proto::JobRow::of(&j)),
             (false, Hit::Stopped(row)) => rows.push(row),
-            (true, Hit::Live(j)) => jobs.push(JobStatus::clone(&j)),
+            (true, Hit::Live(j, live)) => {
+                let mut status = JobStatus::clone(&j);
+                status.live = live;
+                jobs.push(status);
+            }
             // A record that something deleted from the disk gives no entry. A
             // full record is what this reader asked for, and the entry in
             // memory is not one.
@@ -3399,6 +3406,42 @@ mod tests {
         let of = |id: &uuid::Uuid| state.live_use(id, &state.jobs.get(id).unwrap().status);
         assert_eq!(of(&running).map(|l| l.mem), Some(11 << 30));
         assert!(of(&queued).is_none(), "a job that waits has no live use");
+    }
+
+    /// `qex list --json` asks for the full records through `handle_query`, and
+    /// not through `Request::List`: that answer must hold the counted use too.
+    #[test]
+    fn the_full_query_holds_the_counted_use_of_a_running_job() {
+        let coord = Arc::new(Coordinator::new(Config::default(), 0));
+        let running = {
+            let mut state = coord.state.lock().unwrap();
+            let spec = spec_with_key("run");
+            let id = spec.id;
+            let mut status = JobStatus::new(&spec);
+            status.state = JobState::Running;
+            state.jobs.insert(
+                id,
+                Job {
+                    spec,
+                    status: status.into(),
+                    supervisor_pid: None,
+                },
+            );
+            state.mem_used.insert(id, 11 << 30);
+            id
+        };
+
+        let filter = crate::proto::JobFilter {
+            full: true,
+            ..Default::default()
+        };
+        match handle_query(&coord, &filter) {
+            Response::Found { jobs, .. } => {
+                let job = jobs.iter().find(|j| j.id == running).expect("the job");
+                assert_eq!(job.live.as_ref().map(|l| l.mem), Some(11 << 30));
+            }
+            other => panic!("expected a found response, and got {other:?}"),
+        }
     }
 
     /// A cancel that did not happen must name the step that fits the state.
