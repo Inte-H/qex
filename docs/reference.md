@@ -479,6 +479,11 @@ Your claim can be correct, and a larger claim is then the wrong answer. Read the
 qex status $ID --json      # the usage field gives max_rss and cpu_secs
 ```
 
+While a job operates, `qex status --json` and `qex list --json` also carry a
+`live` field: the memory in bytes that the coordinator counts now, with the
+work the job gave to a daemon, and the cores in use (`null` before the second
+measurement). A job that does not operate has no `live` field.
+
 `qex kill` writes a mark before it sends the signal, and that mark always wins.
 A job that you stopped reports `killed`, and never `oom`.
 
