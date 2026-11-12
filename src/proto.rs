@@ -516,6 +516,13 @@ pub enum Response {
         config_error: Option<String>,
         cpu_claimed: u64,
         mem_claimed: u64,
+        /// The memory that the test before a job starts counts: each job that
+        /// operates counts the larger of its claim and its last measurement.
+        ///
+        /// `None` comes from a coordinator that does not say, and a reader
+        /// then has the claims only.
+        #[serde(default)]
+        mem_counted: Option<u64>,
         /// The health of the queue, in one word for a program to read.
         ///
         /// The words are `running`, `paused`, `paused-by-fault`, `held`,

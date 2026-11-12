@@ -158,7 +158,10 @@ each start, which limits the damage, but an accurate claim is better.
 that operates every 5 seconds, with the processes that the job is connected to.
 Before a start, each job counts the larger of its claim and its last
 measurement. A job that gives memory back gives it back to the budget too, so a
-job that climbs again after that can still fill the machine.
+job that climbs again after that can still fill the machine. `qex info` and the
+header of `qex top` give the memory that this test counts, and `qex info` names
+the part above the claims. `qex info --json` gives it as `mem_counted`, and
+`mem_claimed` stays the sum of the claims.
 
 **A job that waits for another job counts at its measured use.** A command
 inside a job can wait for an inner job: `qex run`, `qex submit --wait`,

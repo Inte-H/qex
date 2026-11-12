@@ -4499,6 +4499,23 @@ pub fn queue_line(info: &Response) -> String {
     }
 }
 
+/// Writes the memory that the test before a job starts counts, and the part of
+/// it that the jobs used above their claims.
+fn memory_in_use(claimed: u64, counted: Option<u64>, budget: u64) -> String {
+    let counted = counted.unwrap_or(claimed);
+    let above = counted.saturating_sub(claimed);
+    let note = if above > 0 {
+        format!(" ({} above the claims)", format_size(above))
+    } else {
+        String::new()
+    };
+    format!(
+        "{} of {} in use{note}",
+        format_size(counted),
+        format_size(budget)
+    )
+}
+
 /// Writes the state of the coordinator.
 ///
 /// The process id here comes from the coordinator itself. Use this command to
@@ -4539,6 +4556,7 @@ pub fn info(args: cli::InfoArgs) -> Result<i32> {
             config_error,
             cpu_claimed,
             mem_claimed,
+            mem_counted,
             queue_state,
             paused_at,
             pauses,
@@ -4585,6 +4603,7 @@ pub fn info(args: cli::InfoArgs) -> Result<i32> {
                         // Each value below is null when the coordinator is too
                         // old to measure it. A null says "unknown". It does not
                         // say "zero", and a reader must not read it as zero.
+                        "mem_counted": mem_counted,
                         "queue_line": line,
                         "last_start_at": health.as_ref().and_then(|h| h.last_start_at),
                         "peer_count": health.as_ref().map(|h| h.peer_count),
@@ -4639,9 +4658,8 @@ pub fn info(args: cli::InfoArgs) -> Result<i32> {
             println!("jobs queued:     {jobs_queued}");
             println!("cores:           {cpu_claimed} of {cpu_budget} in use",);
             println!(
-                "memory:          {} of {} in use",
-                format_size(mem_claimed),
-                format_size(mem_budget)
+                "memory:          {}",
+                memory_in_use(mem_claimed, mem_counted, mem_budget)
             );
 
             // Say what the other users hold. The measurement is the one that
@@ -7065,6 +7083,23 @@ pub fn du(args: cli::DuArgs) -> Result<i32> {
 mod tests {
     use super::*;
     use crate::job::Usage;
+
+    #[test]
+    fn the_memory_line_names_the_part_above_the_claims() {
+        assert_eq!(
+            memory_in_use(100 << 20, Some(610 << 20), 17 << 30),
+            "610MB of 17GB in use (510MB above the claims)"
+        );
+        assert_eq!(
+            memory_in_use(100 << 20, Some(100 << 20), 17 << 30),
+            "100MB of 17GB in use"
+        );
+        assert_eq!(
+            memory_in_use(100 << 20, None, 17 << 30),
+            "100MB of 17GB in use",
+            "a coordinator that does not say gives the claims"
+        );
+    }
 
     /// Every answer about the ownership of a job must end with a step.
     ///
