@@ -468,6 +468,7 @@ fn header_lines(ordered: &[JobStatus], info: Option<&Response>, unreachable: boo
         mem_budget,
         cpu_claimed,
         mem_claimed,
+        mem_counted,
         jobs_running,
         jobs_queued,
         queue_state,
@@ -486,7 +487,7 @@ fn header_lines(ordered: &[JobStatus], info: Option<&Response>, unreachable: boo
         lines.push(format!(
             "budget {cpu_claimed}/{cpu_budget} cores, {}/{} memory   \
              {jobs_running} running, {jobs_queued} queued",
-            format_size(*mem_claimed),
+            format_size(mem_counted.unwrap_or(*mem_claimed)),
             format_size(*mem_budget),
         ));
         let mine = crate::version::VERSION;
@@ -1526,6 +1527,7 @@ mod tests {
             mem_budget: 20 << 30,
             cpu_claimed: 2,
             mem_claimed: 4 << 30,
+            mem_counted: Some(4 << 30),
             queue_state: Some("running".into()),
             paused_at: None,
             pauses: Some(vec![]),
@@ -1579,6 +1581,7 @@ mod tests {
             mem_budget,
             cpu_claimed,
             mem_claimed,
+            mem_counted: None,
             config_error: None,
             queue_state: Some("paused".into()),
             paused_at: Some(crate::sys::now_secs() - 360),
@@ -1778,6 +1781,7 @@ mod tests {
             mem_budget,
             cpu_claimed,
             mem_claimed,
+            mem_counted,
             queue_state,
             paused_at,
             pauses,
@@ -1802,6 +1806,7 @@ mod tests {
             mem_budget,
             cpu_claimed,
             mem_claimed,
+            mem_counted,
             config_error: error,
             queue_state,
             paused_at,
@@ -1912,6 +1917,16 @@ mod tests {
             !page.contains("default values"),
             "a file that qex can read is not a fault: {page}"
         );
+    }
+
+    #[test]
+    fn the_header_gives_the_memory_that_the_test_before_a_start_counts() {
+        let mut over = info_with_config_error(None);
+        if let Response::Info { mem_counted, .. } = &mut over {
+            *mem_counted = Some(6 << 30);
+        }
+        let page = paint_live(Some(&over), 100);
+        assert!(page.contains("6GB/20GB memory"), "got: {page}");
     }
 
     /// A coordinator that cannot read the file already holds the last good

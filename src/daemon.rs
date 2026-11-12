@@ -2606,6 +2606,7 @@ fn handle_info(coord: &Arc<Coordinator>, peer: Option<i32>) -> Response {
     };
     let held = state.claimed();
     let (cpu_claimed, mem_claimed) = (held.cpu, held.mem);
+    let mem_counted = state.admission().0.mem;
 
     // Report the pools, and report what the other users hold.
     //
@@ -2666,6 +2667,7 @@ fn handle_info(coord: &Arc<Coordinator>, peer: Option<i32>) -> Response {
         config_error: state.config_error.clone(),
         cpu_claimed,
         mem_claimed,
+        mem_counted: Some(mem_counted),
         queue_state: Some(queue_state),
         // The three values below are for a CLI of an earlier version, which
         // reads one record. This CLI reads `pauses`.
@@ -3306,6 +3308,41 @@ mod tests {
             "a cancel that a person typed leaves no error on the record: {:?}",
             status.error
         );
+    }
+
+    /// `qex info` and the test before a job starts must give one number for
+    /// the memory, or a reader sees free budget while the jobs wait for it.
+    #[test]
+    fn info_gives_the_memory_that_the_test_before_a_start_counts() {
+        let coord = Arc::new(Coordinator::new(Config::default(), 0));
+        {
+            let mut state = coord.state.lock().unwrap();
+            let spec = spec_with_key("over");
+            let id = spec.id;
+            let mut status = JobStatus::new(&spec);
+            status.state = JobState::Running;
+            state.jobs.insert(
+                id,
+                Job {
+                    spec,
+                    status: status.into(),
+                    supervisor_pid: None,
+                },
+            );
+            state.mem_used.insert(id, 5 << 20);
+        }
+
+        match handle_info(&coord, None) {
+            Response::Info {
+                mem_claimed,
+                mem_counted,
+                ..
+            } => {
+                assert_eq!(mem_claimed, 1 << 20, "the claims keep their meaning");
+                assert_eq!(mem_counted, Some(5 << 20));
+            }
+            other => panic!("expected an info response, and got {other:?}"),
+        }
     }
 
     /// A cancel that did not happen must name the step that fits the state.
