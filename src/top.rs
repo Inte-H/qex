@@ -747,7 +747,12 @@ fn job_line(
                     },
                 );
             }
-            (cores, Some(usage.rss))
+            // The coordinator counts the daemon and the test JVMs that the
+            // job gave work to; the process group alone does not.
+            match &job.live {
+                Some(live) => (live.cpu.or(cores), Some(live.mem)),
+                None => (cores, Some(usage.rss)),
+            }
         }
         _ => {
             if update_cpu {
@@ -1491,6 +1496,7 @@ mod tests {
             group: None,
             group_name: None,
             usage: Usage::default(),
+            live: None,
             forced: false,
             forced_reason: None,
             reclaimed_cpu: None,
@@ -1686,6 +1692,22 @@ mod tests {
             !second.contains("..."),
             "the second page must give a number: {second}"
         );
+    }
+
+    /// The coordinator's number holds the daemon and the test JVMs, so a job
+    /// that has one shows it and not the sum of its own process group.
+    #[test]
+    fn a_running_job_shows_the_use_that_the_coordinator_gives() {
+        let mut j = job(JobState::Running, 2, 12 << 30);
+        j.live = Some(crate::job::LiveUse {
+            mem: 11 << 30,
+            cpu: Some(3.5),
+        });
+
+        let mut previous = HashMap::new();
+        let page = render(&[j], Some(&info()), &mut previous, true);
+        assert!(page.contains("11GB"), "the live memory is missing: {page}");
+        assert!(page.contains("3.5"), "the live CPU is missing: {page}");
     }
 
     /// A job that stopped shows its measured peak, and not a live value.

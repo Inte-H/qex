@@ -795,6 +795,17 @@ impl State {
             .sum()
     }
 
+    /// What the job uses now, for the copy of its status that an answer holds.
+    fn live_use(&self, id: &uuid::Uuid, status: &JobStatus) -> Option<crate::job::LiveUse> {
+        if !status.state.is_active() {
+            return None;
+        }
+        Some(crate::job::LiveUse {
+            mem: *self.mem_used.get(id)?,
+            cpu: self.relax.last_use(id, status.pid),
+        })
+    }
+
     pub fn reclaimed_cpu(&self) -> u64 {
         let Ok(Some(after)) = self.cfg.claim_relax_after() else {
             return 0;
@@ -1922,12 +1933,19 @@ fn handle(coord: &Arc<Coordinator>, request: Request, peer: Option<i32>) -> Resp
                 // command sees and the stream does not is a change that an
                 // agent that reads the stream never learns.
                 state.publish_changes();
-                let live: Vec<Arc<JobStatus>> =
-                    state.jobs.values().map(|j| j.status.share()).collect();
+                let live: Vec<JobStatus> = state
+                    .jobs
+                    .iter()
+                    .map(|(id, j)| {
+                        let mut status = JobStatus::clone(&j.status);
+                        status.live = state.live_use(id, &status);
+                        status
+                    })
+                    .collect();
                 let stopped: Vec<uuid::Uuid> = state.stopped.keys().copied().collect();
                 (live, stopped)
             };
-            let mut jobs: Vec<JobStatus> = live.iter().map(|j| JobStatus::clone(j)).collect();
+            let mut jobs = live;
             jobs.extend(stopped.iter().filter_map(stopped_record));
             // The order of the ids, which is the order that this answer always
             // had.
@@ -1966,9 +1984,13 @@ fn handle(coord: &Arc<Coordinator>, request: Request, peer: Option<i32>) -> Resp
             state.refresh_active();
             state.publish_changes();
             match state.known(id) {
-                Some(Known::Live(j)) => Response::Status {
-                    status: Box::new(j.status.clone()),
-                },
+                Some(Known::Live(j)) => {
+                    let mut status = j.status.clone();
+                    status.live = state.live_use(&id, &status);
+                    Response::Status {
+                        status: Box::new(status),
+                    }
+                }
                 Some(Known::Stopped(_)) => {
                     drop(state);
                     stopped_status(id)
@@ -3343,6 +3365,40 @@ mod tests {
             }
             other => panic!("expected an info response, and got {other:?}"),
         }
+    }
+
+    /// `qex list` and `qex status` must show the memory that the coordinator
+    /// counts for a job that operates, the daemon share included, and nothing
+    /// for a job that does not operate.
+    #[test]
+    fn the_status_of_a_running_job_holds_its_counted_use() {
+        let coord = Arc::new(Coordinator::new(Config::default(), 0));
+        let (running, queued) = {
+            let mut state = coord.state.lock().unwrap();
+            let mut ids = Vec::new();
+            for (key, job_state) in [("run", JobState::Running), ("wait", JobState::Queued)] {
+                let spec = spec_with_key(key);
+                let id = spec.id;
+                let mut status = JobStatus::new(&spec);
+                status.state = job_state;
+                state.jobs.insert(
+                    id,
+                    Job {
+                        spec,
+                        status: status.into(),
+                        supervisor_pid: None,
+                    },
+                );
+                state.mem_used.insert(id, 11 << 30);
+                ids.push(id);
+            }
+            (ids[0], ids[1])
+        };
+
+        let state = coord.state.lock().unwrap();
+        let of = |id: &uuid::Uuid| state.live_use(id, &state.jobs.get(id).unwrap().status);
+        assert_eq!(of(&running).map(|l| l.mem), Some(11 << 30));
+        assert!(of(&queued).is_none(), "a job that waits has no live use");
     }
 
     /// A cancel that did not happen must name the step that fits the state.
